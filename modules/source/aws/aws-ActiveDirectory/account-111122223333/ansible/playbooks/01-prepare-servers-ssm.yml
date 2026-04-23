@@ -1,0 +1,256 @@
+# ==============================================================================
+# PLAYBOOK: 01-prepare-servers-ssm.yml
+# Prepares Windows servers for AD DS role using AWS CLI SSM
+#
+# Installs AD DS features and sets hostnames on all DCs
+#
+# Run: ansible-playbook playbooks/01-prepare-servers-ssm.yml
+# ==============================================================================
+---
+- name: Prepare Windows Servers for Active Directory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Verify SSM Agent Status for all DCs
+    # --------------------------------------------------------------------------
+    - name: Check SSM agent status - DC01
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc01.region }}
+          --filters "Key=InstanceIds,Values={{ dc01.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: dc01_ssm
+      changed_when: false
+
+    - name: Check SSM agent status - DC02
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc02.region }}
+          --filters "Key=InstanceIds,Values={{ dc02.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: dc02_ssm
+      changed_when: false
+
+    - name: Check SSM agent status - DC03
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc03.region }}
+          --filters "Key=InstanceIds,Values={{ dc03.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: dc03_ssm
+      changed_when: false
+
+    - name: Display SSM status
+      ansible.builtin.debug:
+        msg: |
+          DC01 ({{ dc01.instance_id }}): {{ dc01_ssm.stdout }}
+          DC02 ({{ dc02.instance_id }}): {{ dc02_ssm.stdout }}
+          DC03 ({{ dc03.instance_id }}): {{ dc03_ssm.stdout }}
+
+    # --------------------------------------------------------------------------
+    # Set Hostname and Install Features on Each Server
+    # --------------------------------------------------------------------------
+    - name: Prepare DC01 (us-east-2)
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 600
+          --parameters '{"commands":["Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False","if ($env:COMPUTERNAME -ne \"{{ dc01.hostname }}\") { Rename-Computer -NewName {{ dc01.hostname }} -Force }","$result = Install-WindowsFeature -Name AD-Domain-Services,DNS,RSAT-AD-Tools,RSAT-DNS-Server,GPMC -IncludeManagementTools","Write-Output \"Hostname: $env:COMPUTERNAME\"","Write-Output \"AD-DS Installed: $((Get-WindowsFeature AD-Domain-Services).Installed)\"","if ($result.RestartNeeded -eq \"Yes\" -or $env:COMPUTERNAME -ne \"{{ dc01.hostname }}\") { Restart-Computer -Force }"]}'
+          --output json
+      register: dc01_prep_cmd
+
+    - name: Prepare DC02 (us-east-1)
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 600
+          --parameters '{"commands":["Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False","if ($env:COMPUTERNAME -ne \"{{ dc02.hostname }}\") { Rename-Computer -NewName {{ dc02.hostname }} -Force }","$result = Install-WindowsFeature -Name AD-Domain-Services,DNS,RSAT-AD-Tools,RSAT-DNS-Server,GPMC -IncludeManagementTools","Write-Output \"Hostname: $env:COMPUTERNAME\"","Write-Output \"AD-DS Installed: $((Get-WindowsFeature AD-Domain-Services).Installed)\"","if ($result.RestartNeeded -eq \"Yes\" -or $env:COMPUTERNAME -ne \"{{ dc02.hostname }}\") { Restart-Computer -Force }"]}'
+          --output json
+      register: dc02_prep_cmd
+
+    - name: Prepare DC03 (ap-southeast-1)
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 600
+          --parameters '{"commands":["Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False","if ($env:COMPUTERNAME -ne \"{{ dc03.hostname }}\") { Rename-Computer -NewName {{ dc03.hostname }} -Force }","$result = Install-WindowsFeature -Name AD-Domain-Services,DNS,RSAT-AD-Tools,RSAT-DNS-Server,GPMC -IncludeManagementTools","Write-Output \"Hostname: $env:COMPUTERNAME\"","Write-Output \"AD-DS Installed: $((Get-WindowsFeature AD-Domain-Services).Installed)\"","if ($result.RestartNeeded -eq \"Yes\" -or $env:COMPUTERNAME -ne \"{{ dc03.hostname }}\") { Restart-Computer -Force }"]}'
+          --output json
+      register: dc03_prep_cmd
+
+    # --------------------------------------------------------------------------
+    # Wait for commands to complete
+    # --------------------------------------------------------------------------
+    - name: Wait for DC01 preparation
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (dc01_prep_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: dc01_result
+      until: "(dc01_result.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut']"
+      retries: 30
+      delay: 20
+
+    - name: Wait for DC02 preparation
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ (dc02_prep_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: dc02_result
+      until: "(dc02_result.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut']"
+      retries: 30
+      delay: 20
+
+    - name: Wait for DC03 preparation
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (dc03_prep_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: dc03_result
+      until: "(dc03_result.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut']"
+      retries: 30
+      delay: 20
+
+    - name: Display results
+      ansible.builtin.debug:
+        msg: |
+          DC01: {{ (dc01_result.stdout | from_json)[0] }}
+          {{ (dc01_result.stdout | from_json)[1] }}
+          
+          DC02: {{ (dc02_result.stdout | from_json)[0] }}
+          {{ (dc02_result.stdout | from_json)[1] }}
+          
+          DC03: {{ (dc03_result.stdout | from_json)[0] }}
+          {{ (dc03_result.stdout | from_json)[1] }}
+
+    # --------------------------------------------------------------------------
+    # Wait for reboots to complete
+    # --------------------------------------------------------------------------
+    - name: Wait for servers to reboot
+      ansible.builtin.pause:
+        seconds: 180
+        prompt: "Waiting 3 minutes for servers to reboot and SSM agents to reconnect..."
+
+    # --------------------------------------------------------------------------
+    # Verify all servers are back online
+    # --------------------------------------------------------------------------
+    - name: Wait for DC01 SSM
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc01.region }}
+          --filters "Key=InstanceIds,Values={{ dc01.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: dc01_ssm_final
+      until: dc01_ssm_final.stdout == "Online"
+      retries: 20
+      delay: 15
+
+    - name: Wait for DC02 SSM
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc02.region }}
+          --filters "Key=InstanceIds,Values={{ dc02.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: dc02_ssm_final
+      until: dc02_ssm_final.stdout == "Online"
+      retries: 20
+      delay: 15
+
+    - name: Wait for DC03 SSM
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc03.region }}
+          --filters "Key=InstanceIds,Values={{ dc03.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: dc03_ssm_final
+      until: dc03_ssm_final.stdout == "Online"
+      retries: 20
+      delay: 15
+
+    # --------------------------------------------------------------------------
+    # Final Verification
+    # --------------------------------------------------------------------------
+    - name: Verify DC01 hostname and features
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["Write-Output \"Hostname: $env:COMPUTERNAME\"","Write-Output \"AD-DS: $((Get-WindowsFeature AD-Domain-Services).Installed)\"","Write-Output \"DNS: $((Get-WindowsFeature DNS).Installed)\""]}'
+          --output json
+      register: dc01_verify_cmd
+
+    - name: Get DC01 verification
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (dc01_verify_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: dc01_verify
+      until: dc01_verify is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Preparation complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Server Preparation Complete
+          ============================================
+          
+          DC01 (us-east-2): {{ dc01.instance_id }}
+          DC02 (us-east-1): {{ dc02.instance_id }}
+          DC03 (ap-southeast-1): {{ dc03.instance_id }}
+          
+          All servers have:
+            - Windows Firewall DISABLED
+            - AD DS features INSTALLED
+            - Hostnames SET
+          
+          Next step: Run 02-promote-dc01-ssm.yml
+          ============================================

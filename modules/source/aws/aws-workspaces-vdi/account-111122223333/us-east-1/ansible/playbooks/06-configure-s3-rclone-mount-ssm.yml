@@ -1,0 +1,437 @@
+# ==============================================================================
+# PLAYBOOK: 06-configure-s3-rclone-mount-ssm.yml
+# Configures S3 bucket mount as a network drive using rclone + NSSM service
+#
+# This playbook:
+#   1. Fetches S3 sync credentials from AWS Secrets Manager
+#   2. Creates a GPO startup script that:
+#      - Installs rclone if not present
+#      - Installs NSSM (service manager) if not present
+#      - Configures rclone with S3 credentials
+#      - Creates and starts a Windows service to mount S3 as S: drive
+#
+# Prerequisites:
+#   - S3 bucket created via Terraform (org-workspace-vdi-installs)
+#   - S3 sync credentials stored in Secrets Manager
+#   - WorkSpaces Computers OU exists
+#
+# Usage:
+#   cd ~/Repos/cloud_infrastructure/org-workspaces-vdi/us-east-1/ansible
+#   ansible-playbook playbooks/06-configure-s3-rclone-mount-ssm.yml -v
+#
+# ==============================================================================
+---
+- name: Configure S3 Rclone Mount GPO Startup Script
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+    # S3 sync credentials secret (stored by Terraform in default region)
+    s3_credentials_secret: "org-workspaces-s3-sync-credentials"
+    s3_credentials_region: "us-east-2"
+    # Mount configuration
+    s3_mount_drive_letter: "S"
+    s3_mount_service_name: "RcloneS3Mount"
+    # GPO settings
+    startup_script_name: "Mount-S3-Drive.ps1"
+    startup_script_gpo: "WorkSpaces-S3-Mount-Startup"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Step 1: Fetch S3 Credentials from Secrets Manager
+    # --------------------------------------------------------------------------
+    - name: Fetch S3 sync credentials from Secrets Manager
+      ansible.builtin.command:
+        cmd: >
+          aws secretsmanager get-secret-value
+          --region {{ s3_credentials_region }}
+          --secret-id {{ s3_credentials_secret }}
+          --query SecretString
+          --output text
+      register: s3_creds_result
+      changed_when: false
+      no_log: true
+
+    - name: Parse S3 credentials
+      ansible.builtin.set_fact:
+        s3_access_key: "{{ (s3_creds_result.stdout | from_json).access_key_id }}"
+        s3_secret_key: "{{ (s3_creds_result.stdout | from_json).secret_access_key }}"
+      no_log: true
+
+    - name: Confirm credentials loaded
+      ansible.builtin.debug:
+        msg: "✓ S3 sync credentials loaded from Secrets Manager"
+
+    # --------------------------------------------------------------------------
+    # Step 2: Create PowerShell Startup Script in NETLOGON
+    # --------------------------------------------------------------------------
+    - name: Create PowerShell startup script in NETLOGON
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 120
+          --parameters commands='["$scriptContent = @\"
+
+          # ==============================================================================
+          # S3 Mount Script - STARTUP VERSION
+          # Runs at computer startup via GPO (as SYSTEM)
+          # Mounts s3://{{ s3_installers_bucket }} as {{ s3_mount_drive_letter }}: drive
+          # ==============================================================================
+
+          `$ErrorActionPreference = \"Stop\"
+          `$LogFile = \"C:\\Windows\\Temp\\s3-mount.log\"
+
+          function Write-Log {
+              param([string]`$Message)
+              `$timestamp = Get-Date -Format \"yyyy-MM-dd HH:mm:ss\"
+              \"`$timestamp - `$Message\" | Out-File -FilePath `$LogFile -Append
+              Write-Output `$Message
+          }
+
+          Write-Log \"========== S3 MOUNT STARTUP SCRIPT ==========\"
+          Write-Log \"Running as: `$env:USERNAME\"
+
+          # Paths
+          `$rcloneDir = \"C:\\Program Files\\rclone\"
+          `$rcloneExe = \"`$rcloneDir\\rclone.exe\"
+          `$nssmDir = \"C:\\Program Files\\nssm\"
+          `$nssmExe = \"`$nssmDir\\nssm.exe\"
+          `$rcloneConfig = \"C:\\ProgramData\\rclone\\rclone.conf\"
+          `$serviceName = \"{{ s3_mount_service_name }}\"
+          `$driveLetter = \"{{ s3_mount_drive_letter }}\"
+
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          # --------------------------------------------------------------------------
+          # Install rclone if not present
+          # --------------------------------------------------------------------------
+          if (-not (Test-Path `$rcloneExe)) {
+              Write-Log \"Installing rclone...\"
+              try {
+                  `$rcloneZip = \"C:\\Windows\\Temp\\rclone.zip\"
+                  Invoke-WebRequest -Uri \"https://downloads.rclone.org/rclone-current-windows-amd64.zip\" -OutFile `$rcloneZip -UseBasicParsing
+                  Expand-Archive -Path `$rcloneZip -DestinationPath \"C:\\Windows\\Temp\\rclone\" -Force
+                  New-Item -ItemType Directory -Path `$rcloneDir -Force | Out-Null
+                  Copy-Item \"C:\\Windows\\Temp\\rclone\\rclone-*\\rclone.exe\" -Destination `$rcloneDir -Force
+                  Remove-Item `$rcloneZip -Force -ErrorAction SilentlyContinue
+                  Remove-Item \"C:\\Windows\\Temp\\rclone\" -Recurse -Force -ErrorAction SilentlyContinue
+                  Write-Log \"rclone installed successfully\"
+              } catch {
+                  Write-Log \"ERROR: Failed to install rclone - `$_\"
+                  exit 1
+              }
+          } else {
+              Write-Log \"rclone already installed\"
+          }
+
+          # --------------------------------------------------------------------------
+          # Install NSSM if not present
+          # --------------------------------------------------------------------------
+          if (-not (Test-Path `$nssmExe)) {
+              Write-Log \"Installing NSSM...\"
+              try {
+                  `$nssmZip = \"C:\\Windows\\Temp\\nssm.zip\"
+                  Invoke-WebRequest -Uri \"https://nssm.cc/release/nssm-2.24.zip\" -OutFile `$nssmZip -UseBasicParsing
+                  Expand-Archive -Path `$nssmZip -DestinationPath \"C:\\Windows\\Temp\\nssm\" -Force
+                  New-Item -ItemType Directory -Path `$nssmDir -Force | Out-Null
+                  Copy-Item \"C:\\Windows\\Temp\\nssm\\nssm-2.24\\win64\\nssm.exe\" -Destination `$nssmDir -Force
+                  Remove-Item `$nssmZip -Force -ErrorAction SilentlyContinue
+                  Remove-Item \"C:\\Windows\\Temp\\nssm\" -Recurse -Force -ErrorAction SilentlyContinue
+                  Write-Log \"NSSM installed successfully\"
+              } catch {
+                  Write-Log \"ERROR: Failed to install NSSM - `$_\"
+                  exit 1
+              }
+          } else {
+              Write-Log \"NSSM already installed\"
+          }
+
+          # --------------------------------------------------------------------------
+          # Configure rclone
+          # --------------------------------------------------------------------------
+          Write-Log \"Configuring rclone...\"
+          `$configDir = Split-Path `$rcloneConfig -Parent
+          if (-not (Test-Path `$configDir)) {
+              New-Item -ItemType Directory -Path `$configDir -Force | Out-Null
+          }
+
+          `$rcloneConfigContent = @\"
+          [s3-installers]
+          type = s3
+          provider = AWS
+          access_key_id = {{ s3_access_key }}
+          secret_access_key = {{ s3_secret_key }}
+          region = {{ s3_installers_region }}
+          \"@
+
+          `$rcloneConfigContent | Out-File -FilePath `$rcloneConfig -Encoding ASCII -Force
+          Write-Log \"rclone configured at `$rcloneConfig\"
+
+          # --------------------------------------------------------------------------
+          # Create/Update Windows Service
+          # --------------------------------------------------------------------------
+          `$service = Get-Service -Name `$serviceName -ErrorAction SilentlyContinue
+
+          if (-not `$service) {
+              Write-Log \"Creating `$serviceName service...\"
+              & `$nssmExe install `$serviceName `$rcloneExe \"mount s3-installers:{{ s3_installers_bucket }} `${driveLetter}: --config `$rcloneConfig --vfs-cache-mode full --network-mode\"
+              & `$nssmExe set `$serviceName AppDirectory `$rcloneDir
+              & `$nssmExe set `$serviceName DisplayName \"Rclone S3 Installers Mount\"
+              & `$nssmExe set `$serviceName Description \"Mounts S3 installers bucket as `${driveLetter}: drive\"
+              & `$nssmExe set `$serviceName Start SERVICE_AUTO_START
+              & `$nssmExe set `$serviceName ObjectName LocalSystem
+              Write-Log \"Service created\"
+          } else {
+              Write-Log \"Service `$serviceName already exists\"
+          }
+
+          # --------------------------------------------------------------------------
+          # Start Service if not running
+          # --------------------------------------------------------------------------
+          `$service = Get-Service -Name `$serviceName -ErrorAction SilentlyContinue
+          if (`$service.Status -ne \"Running\") {
+              Write-Log \"Starting `$serviceName service...\"
+              Start-Service -Name `$serviceName
+              Start-Sleep -Seconds 5
+              `$service = Get-Service -Name `$serviceName
+              Write-Log \"Service status: `$(`$service.Status)\"
+          } else {
+              Write-Log \"Service already running\"
+          }
+
+          # --------------------------------------------------------------------------
+          # Verify mount
+          # --------------------------------------------------------------------------
+          Start-Sleep -Seconds 3
+          if (Test-Path \"`${driveLetter}:\\\") {
+              Write-Log \"SUCCESS: `${driveLetter}: drive is mounted\"
+              `$items = Get-ChildItem \"`${driveLetter}:\\\" -ErrorAction SilentlyContinue
+              Write-Log \"Items in `${driveLetter}: drive: `$(`$items.Count)\"
+          } else {
+              Write-Log \"WARNING: `${driveLetter}: drive not yet available (may take a moment)\"
+          }
+
+          Write-Log \"========== S3 MOUNT SCRIPT COMPLETE ==========\"
+
+          \"@
+
+          `$scriptPath = \"\\\\{{ ad_domain_name }}\\NETLOGON\\{{ startup_script_name }}\"
+          `$scriptContent | Out-File -FilePath `$scriptPath -Encoding UTF8 -Force
+          Write-Output \"Created startup script: `$scriptPath\"
+          "]'
+          --output json
+      register: script_cmd
+      no_log: true
+
+    - name: Wait for script creation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (script_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: script_result
+      until: "(script_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 8
+
+    - name: Display script result
+      ansible.builtin.debug:
+        msg: "{{ (script_result.stdout | from_json)[1] }}"
+
+    - name: Check for script errors
+      ansible.builtin.fail:
+        msg: "Script creation failed: {{ (script_result.stdout | from_json)[2] }}"
+      when: "(script_result.stdout | from_json)[0] == 'Failed'"
+
+    # --------------------------------------------------------------------------
+    # Step 3: Create GPO for Startup Script
+    # --------------------------------------------------------------------------
+    - name: Create GPO for startup script
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 180
+          --parameters '{"commands":["Import-Module GroupPolicy; $gpoName = \"{{ startup_script_gpo }}\"; $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue; if (-not $gpo) { $gpo = New-GPO -Name $gpoName -Comment \"Mounts S3 installers bucket as {{ s3_mount_drive_letter }}: drive using rclone\"; Write-Output \"Created GPO: $gpoName\" } else { Write-Output \"GPO already exists: $gpoName\" }; Write-Output \"GPO ID: $($gpo.Id)\""]}'
+          --output json
+      register: gpo_create_cmd
+
+    - name: Wait for GPO creation
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (gpo_create_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: gpo_create_result
+      until: "(gpo_create_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 8
+
+    - name: Display GPO creation result
+      ansible.builtin.debug:
+        msg: "{{ (gpo_create_result.stdout | from_json)[1] }}"
+
+    - name: Fail if GPO creation failed
+      ansible.builtin.fail:
+        msg: "GPO creation failed: {{ (gpo_create_result.stdout | from_json)[2] }}"
+      when: "(gpo_create_result.stdout | from_json)[0] == 'Failed'"
+
+    # --------------------------------------------------------------------------
+    # Step 4: Link GPO to WorkSpaces Computers OU
+    # --------------------------------------------------------------------------
+    - name: Link GPO to OU
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 120
+          --parameters '{"commands":["Import-Module GroupPolicy; $gpoName = \"{{ startup_script_gpo }}\"; $ou = \"{{ workspaces_computers_ou }}\"; $gpo = Get-GPO -Name $gpoName; $existingLink = (Get-GPInheritance -Target $ou).GpoLinks | Where-Object { $_.DisplayName -eq $gpoName }; if (-not $existingLink) { New-GPLink -Guid $gpo.Id -Target $ou -LinkEnabled Yes | Out-Null; Write-Output \"Linked GPO to: $ou\" } else { Write-Output \"GPO already linked to: $ou\" }"]}'
+          --output json
+      register: gpo_link_cmd
+
+    - name: Wait for GPO link
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (gpo_link_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: gpo_link_result
+      until: "(gpo_link_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 8
+
+    - name: Display GPO link result
+      ansible.builtin.debug:
+        msg: "{{ (gpo_link_result.stdout | from_json)[1] }}"
+
+    # --------------------------------------------------------------------------
+    # Step 5: Configure Computer Startup Script in GPO
+    # --------------------------------------------------------------------------
+    - name: Configure GPO startup script
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 180
+          --parameters '{"commands":["Import-Module GroupPolicy; $gpoName = \"{{ startup_script_gpo }}\"; $scriptName = \"{{ startup_script_name }}\"; $gpo = Get-GPO -Name $gpoName; $gpoId = $gpo.Id.ToString(); $sysvolPath = \"\\\\{{ ad_domain_name }}\\SYSVOL\\{{ ad_domain_name }}\\Policies\\{$gpoId}\"; $machineScriptsPath = \"$sysvolPath\\Machine\\Scripts\"; $startupPath = \"$machineScriptsPath\\Startup\"; if (-not (Test-Path $machineScriptsPath)) { New-Item -ItemType Directory -Path $machineScriptsPath -Force | Out-Null }; if (-not (Test-Path $startupPath)) { New-Item -ItemType Directory -Path $startupPath -Force | Out-Null }; Copy-Item \"\\\\{{ ad_domain_name }}\\NETLOGON\\$scriptName\" -Destination $startupPath -Force; $scriptsIni = \"[Startup]`r`n0CmdLine=$scriptName`r`n0Parameters=\"; $scriptsIni | Out-File -FilePath \"$machineScriptsPath\\scripts.ini\" -Encoding ASCII -Force; $psscriptsIni = \"[Startup]`r`n0CmdLine=$scriptName`r`n0Parameters=\"; $psscriptsIni | Out-File -FilePath \"$machineScriptsPath\\psscripts.ini\" -Encoding ASCII -Force; Write-Output \"Configured startup script: $scriptName\"; Write-Output \"Script path: $startupPath\\$scriptName\""]}'
+          --output json
+      register: gpo_script_cmd
+
+    - name: Wait for GPO script configuration
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (gpo_script_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: gpo_script_result
+      until: "(gpo_script_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 20
+      delay: 10
+
+    - name: Display GPO script result
+      ansible.builtin.debug:
+        msg: "{{ (gpo_script_result.stdout | from_json)[1] }}"
+
+    - name: Check for GPO script errors
+      ansible.builtin.fail:
+        msg: "GPO script configuration failed: {{ (gpo_script_result.stdout | from_json)[2] }}"
+      when: "(gpo_script_result.stdout | from_json)[0] == 'Failed'"
+
+    # --------------------------------------------------------------------------
+    # Step 6: Force AD Replication
+    # --------------------------------------------------------------------------
+    - name: Force AD replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["repadmin /syncall /A /e /P | Out-Null; Write-Output \"AD replication initiated\""]'
+          --output json
+      register: repl_cmd
+
+    - name: Wait for replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (repl_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: repl_result
+      until: repl_result is succeeded
+      retries: 10
+      delay: 5
+
+    # --------------------------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------------------------
+    - name: Configuration complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          S3 RCLONE MOUNT GPO CONFIGURED
+          ============================================
+          
+          Startup Script: \\{{ ad_domain_name }}\NETLOGON\{{ startup_script_name }}
+          GPO Name: {{ startup_script_gpo }}
+          Target OU: {{ workspaces_computers_ou }}
+          
+          S3 Bucket: s3://{{ s3_installers_bucket }}
+          Mount Point: {{ s3_mount_drive_letter }}:\
+          Service Name: {{ s3_mount_service_name }}
+          
+          WHAT HAPPENS AT COMPUTER STARTUP:
+          1. Script runs as SYSTEM (has admin rights)
+          2. Installs rclone if not present
+          3. Installs NSSM if not present
+          4. Configures rclone with S3 credentials
+          5. Creates Windows service to mount S3
+          6. Starts the service (mounts {{ s3_mount_drive_letter }}: drive)
+          
+          FOR EXISTING WORKSPACES:
+          Option A - Reboot the WorkSpace:
+            - AWS Console > WorkSpaces > Select > Actions > Reboot
+          
+          Option B - Run manually (PowerShell as Admin):
+            \\{{ ad_domain_name }}\NETLOGON\{{ startup_script_name }}
+          
+          VERIFY ON WORKSPACE:
+          - Check {{ s3_mount_drive_letter }}: drive in File Explorer
+          - Check service: Get-Service {{ s3_mount_service_name }}
+          - Check logs: C:\Windows\Temp\s3-mount.log
+          
+          UPLOAD FILES TO S3:
+          aws s3 cp installer.exe s3://{{ s3_installers_bucket }}/
+          
+          Files will appear on {{ s3_mount_drive_letter }}: drive within seconds!
+          
+          ============================================

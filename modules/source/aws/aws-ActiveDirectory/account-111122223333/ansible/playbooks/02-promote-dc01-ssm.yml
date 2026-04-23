@@ -1,0 +1,276 @@
+# ==============================================================================
+# PLAYBOOK: 02-promote-dc01-ssm.yml
+# Promotes DC01 as the first domain controller (creates new forest)
+#
+# Run: ansible-playbook playbooks/02-promote-dc01-ssm.yml
+# ==============================================================================
+---
+- name: Promote DC01 as Primary Domain Controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Load Secrets
+    # --------------------------------------------------------------------------
+    - name: Load secrets from AWS Secrets Manager
+      include_tasks: load-secrets.yml
+
+    # --------------------------------------------------------------------------
+    # Check if already a DC
+    # --------------------------------------------------------------------------
+    - name: Check if DC01 is already a domain controller
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["try { $d = Get-ADDomain -ErrorAction Stop; Write-Output \"ALREADY_DC:$($d.DNSRoot)\" } catch { Write-Output \"NOT_A_DC\" }"]}'
+          --output json
+      register: dc_check_cmd
+
+    - name: Wait for DC check
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (dc_check_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: dc_check_result
+      until: dc_check_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display DC check
+      ansible.builtin.debug:
+        msg: "DC01 status: {{ dc_check_result.stdout | trim }}"
+
+    - name: Skip if already a DC
+      ansible.builtin.meta: end_play
+      when: "'ALREADY_DC' in dc_check_result.stdout"
+
+    # --------------------------------------------------------------------------
+    # Promote DC01 as First DC (New Forest)
+    # --------------------------------------------------------------------------
+    - name: Display promotion parameters
+      ansible.builtin.debug:
+        msg: |
+          Promoting DC01 as first domain controller:
+            Domain: {{ ad_domain_name }}
+            NetBIOS: {{ ad_netbios_name }}
+            Forest Mode: {{ ad_forest_mode }}
+
+    - name: Install AD DS Forest on DC01
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 1800
+          --parameters '{"commands":["$pw = ConvertTo-SecureString \"{{ ad_password }}\" -AsPlainText -Force; Install-ADDSForest -DomainName \"{{ ad_domain_name }}\" -DomainNetbiosName \"{{ ad_netbios_name }}\" -ForestMode \"{{ ad_forest_mode }}\" -DomainMode \"{{ ad_domain_mode }}\" -InstallDns:$true -CreateDnsDelegation:$false -DatabasePath \"C:\\Windows\\NTDS\" -LogPath \"C:\\Windows\\NTDS\" -SysvolPath \"C:\\Windows\\SYSVOL\" -SafeModeAdministratorPassword $pw -NoRebootOnCompletion:$false -Force:$true; Write-Output \"PROMOTION_STARTED\""]}'
+          --output json
+      register: promote_cmd
+
+    - name: Get promotion command ID
+      ansible.builtin.set_fact:
+        promote_cmd_id: "{{ (promote_cmd.stdout | from_json).Command.CommandId }}"
+
+    - name: Display promotion status
+      ansible.builtin.debug:
+        msg: "Promotion command ID: {{ promote_cmd_id }} - Server will reboot automatically"
+
+    - name: Wait for promotion command
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ promote_cmd_id }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: promote_status
+      until: "(promote_status.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut', 'Cancelled']"
+      retries: 30
+      delay: 30
+      ignore_errors: true
+
+    # --------------------------------------------------------------------------
+    # Wait for Reboot
+    # --------------------------------------------------------------------------
+    - name: Wait for DC01 to reboot
+      ansible.builtin.pause:
+        seconds: 180
+        prompt: "Waiting 3 minutes for DC01 to reboot and AD DS to start..."
+
+    - name: Wait for SSM agent to come back online
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc01.region }}
+          --filters "Key=InstanceIds,Values={{ dc01.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: ssm_ping
+      until: ssm_ping.stdout == "Online"
+      retries: 20
+      delay: 15
+
+    # --------------------------------------------------------------------------
+    # Verify AD DS Running
+    # --------------------------------------------------------------------------
+    - name: Wait for AD DS to be operational
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["$attempts = 0; while ($attempts -lt 30) { $attempts++; try { $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop; Write-Output \"SUCCESS:$($dc.Domain)\"; exit 0 } catch { Write-Output \"Waiting... (attempt $attempts)\"; Start-Sleep 10 } }; Write-Output \"FAILED\"; exit 1"]}'
+          --output json
+      register: verify_cmd
+
+    - name: Wait for verification
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (verify_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: verify_result
+      until: "(verify_result.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut']"
+      retries: 20
+      delay: 30
+
+    - name: Display verification
+      ansible.builtin.debug:
+        msg: "{{ (verify_result.stdout | from_json)[1] }}"
+
+    - name: Fail if AD DS not running
+      ansible.builtin.fail:
+        msg: "AD DS failed to start on DC01"
+      when: "'SUCCESS' not in (verify_result.stdout | from_json)[1]"
+
+    # --------------------------------------------------------------------------
+    # Configure DNS Forwarders
+    # --------------------------------------------------------------------------
+    - name: Configure DNS forwarders
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["Set-DnsServerForwarder -IPAddress @(\"169.254.169.253\",\"8.8.8.8\") -PassThru | Format-List"]}'
+          --output json
+      register: dns_cmd
+
+    - name: Wait for DNS configuration
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (dns_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: dns_result
+      until: dns_result is succeeded
+      retries: 10
+      delay: 5
+
+    # --------------------------------------------------------------------------
+    # Reset Administrator Password (for joining other DCs)
+    # --------------------------------------------------------------------------
+    - name: Reset Administrator password to known value
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["Set-ADAccountPassword -Identity Administrator -Reset -NewPassword (ConvertTo-SecureString \"{{ ad_password }}\" -AsPlainText -Force); Set-ADUser -Identity Administrator -PasswordNeverExpires $true; Write-Output \"Password reset successfully\""]}'
+          --output json
+      register: pwd_cmd
+
+    - name: Wait for password reset
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (pwd_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: pwd_result
+      until: pwd_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display password reset result
+      ansible.builtin.debug:
+        msg: "{{ pwd_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Get DC Information
+    # --------------------------------------------------------------------------
+    - name: Get DC01 information
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["$dc = Get-ADDomainController -Identity $env:COMPUTERNAME; $info = [ordered]@{ Hostname = $dc.HostName; Domain = $dc.Domain; Forest = $dc.Forest; Site = $dc.Site; IsGC = $dc.IsGlobalCatalog; IP = $dc.IPv4Address }; $info | ConvertTo-Json"]}'
+          --output json
+      register: info_cmd
+
+    - name: Wait for info command
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (info_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: info_result
+      until: info_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display DC01 info
+      ansible.builtin.debug:
+        msg: "{{ info_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Complete
+    # --------------------------------------------------------------------------
+    - name: Promotion complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          DC01 PROMOTION COMPLETE
+          ============================================
+          
+          Domain: {{ ad_domain_name }}
+          NetBIOS: {{ ad_netbios_name }}
+          Password: {{ ad_password }}
+          
+          DC01 is now the primary domain controller.
+          Administrator password has been reset.
+          
+          Next step: Run 03-promote-dc02-ssm.yml
+          ============================================

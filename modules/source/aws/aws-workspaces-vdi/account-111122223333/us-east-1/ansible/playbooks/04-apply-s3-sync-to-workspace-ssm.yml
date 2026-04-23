@@ -1,0 +1,145 @@
+# ==============================================================================
+# PLAYBOOK: 04-apply-s3-sync-to-workspace-ssm.yml
+# Applies S3 sync configuration to an existing WorkSpace
+#
+# This playbook reboots the WorkSpace to apply GPO, or provides manual steps.
+#
+# Usage:
+#   ansible-playbook playbooks/04-apply-s3-sync-to-workspace-ssm.yml -e "username=rochellec"
+#
+# Run: ansible-playbook playbooks/04-apply-s3-sync-to-workspace-ssm.yml -e "username=USERNAME"
+# ==============================================================================
+---
+- name: Apply S3 Sync to Existing WorkSpace
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+    username: ""
+    s3_bucket: "org-workspace-vdi-installs"
+    local_path: "C:\\Installers"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Validate Input
+    # --------------------------------------------------------------------------
+    - name: Validate username provided
+      ansible.builtin.fail:
+        msg: "Username is required. Usage: ansible-playbook playbooks/04-apply-s3-sync-to-workspace-ssm.yml -e \"username=USERNAME\""
+      when: username == ""
+
+    # --------------------------------------------------------------------------
+    # Get WorkSpace ID
+    # --------------------------------------------------------------------------
+    - name: Get WorkSpace ID for user
+      ansible.builtin.command:
+        cmd: >
+          aws workspaces describe-workspaces
+          --region {{ aws_region }}
+          --query "Workspaces[?UserName=='{{ username }}'].{WorkspaceId:WorkspaceId,State:State,ComputerName:ComputerName,IpAddress:IpAddress}"
+          --output json
+      register: workspace_info
+
+    - name: Parse WorkSpace info
+      ansible.builtin.set_fact:
+        workspaces: "{{ workspace_info.stdout | from_json }}"
+
+    - name: Display WorkSpace info
+      ansible.builtin.debug:
+        msg: |
+          Found {{ workspaces | length }} WorkSpace(s) for user {{ username }}:
+          {{ workspaces | to_nice_yaml }}
+
+    - name: Fail if no WorkSpace found
+      ansible.builtin.fail:
+        msg: "No WorkSpace found for user {{ username }}"
+      when: workspaces | length == 0
+
+    - name: Set WorkSpace ID
+      ansible.builtin.set_fact:
+        workspace_id: "{{ workspaces[0].WorkspaceId }}"
+        workspace_state: "{{ workspaces[0].State }}"
+        computer_name: "{{ workspaces[0].ComputerName | default('Unknown') }}"
+
+    - name: Display WorkSpace details
+      ansible.builtin.debug:
+        msg: |
+          WorkSpace ID: {{ workspace_id }}
+          State: {{ workspace_state }}
+          Computer Name: {{ computer_name }}
+
+    # --------------------------------------------------------------------------
+    # Reboot WorkSpace to Apply GPO
+    # --------------------------------------------------------------------------
+    - name: Confirm reboot
+      ansible.builtin.pause:
+        prompt: |
+          
+          About to REBOOT WorkSpace {{ workspace_id }} for user {{ username }}.
+          This will disconnect any active session.
+          
+          Press Enter to continue or Ctrl+C to abort...
+      when: workspace_state == "AVAILABLE"
+
+    - name: Reboot WorkSpace
+      ansible.builtin.command:
+        cmd: >
+          aws workspaces reboot-workspaces
+          --region {{ aws_region }}
+          --reboot-workspace-requests '[{"WorkspaceId":"{{ workspace_id }}"}]'
+          --output json
+      register: reboot_result
+      when: workspace_state == "AVAILABLE"
+
+    - name: Display reboot result
+      ansible.builtin.debug:
+        msg: "Reboot initiated for {{ workspace_id }}"
+      when: workspace_state == "AVAILABLE"
+
+    - name: Skip reboot - WorkSpace not available
+      ansible.builtin.debug:
+        msg: "WorkSpace is in state '{{ workspace_state }}', cannot reboot. Wait for it to be AVAILABLE."
+      when: workspace_state != "AVAILABLE"
+
+    # --------------------------------------------------------------------------
+    # Alternative: Manual Steps
+    # --------------------------------------------------------------------------
+    - name: Display manual steps
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          S3 SYNC FOR {{ username | upper }}
+          ============================================
+          
+          WorkSpace ID: {{ workspace_id }}
+          Computer Name: {{ computer_name }}
+          
+          {% if workspace_state == "AVAILABLE" %}
+          Reboot initiated. After reboot, GPO will apply automatically.
+          {% else %}
+          WorkSpace not available for reboot.
+          {% endif %}
+          
+          MANUAL STEPS (if needed):
+          -------------------------
+          1. Connect to the WorkSpace as {{ username }}
+          
+          2. Open Command Prompt as Administrator
+          
+          3. Run the sync script:
+             \\example.internal\NETLOGON\Sync-S3-Installers.bat
+          
+          4. Or run these commands manually:
+             mkdir C:\Installers
+             aws configure set region {{ aws_region }}
+             aws s3 sync s3://{{ s3_bucket }} C:\Installers
+          
+          5. After sync, installers will be at:
+             {{ local_path }}
+          
+          ============================================

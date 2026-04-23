@@ -1,0 +1,169 @@
+# ==============================================================================
+# PLAYBOOK: 02-promote-dc01.yml
+# Promotes DC01 as the first domain controller (creates new forest)
+#
+# Prerequisites:
+#   - Run 01-prepare-servers.yml first
+#   - Set environment variables:
+#     export AD_SAFE_MODE_PASSWORD="YourDSRMPassword123"
+#     export AD_ADMIN_PASSWORD="YourAdminPassword123"
+#
+# Run: ansible-playbook playbooks/02-promote-dc01.yml
+# ==============================================================================
+---
+- name: Promote DC01 as Primary Domain Controller
+  hosts: dc01
+  gather_facts: true
+
+  pre_tasks:
+    - name: Validate required passwords are set
+      ansible.builtin.assert:
+        that:
+          - ad_safe_mode_password | length > 0
+          - ad_admin_password | length > 0
+        fail_msg: |
+          Required passwords not set. Please set environment variables:
+            export AD_SAFE_MODE_PASSWORD="YourPassword"
+            export AD_ADMIN_PASSWORD="YourPassword"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Check Current State
+    # --------------------------------------------------------------------------
+    - name: Check if already a domain controller
+      ansible.windows.win_shell: |
+        try {
+          $domain = Get-ADDomain -ErrorAction Stop
+          Write-Output "ALREADY_DC:$($domain.DNSRoot)"
+        } catch {
+          Write-Output "NOT_A_DC"
+        }
+      register: dc_check
+      ignore_errors: true
+
+    - name: Skip if already a domain controller
+      ansible.builtin.meta: end_play
+      when: "'ALREADY_DC' in dc_check.stdout"
+
+    # --------------------------------------------------------------------------
+    # Create New Forest
+    # --------------------------------------------------------------------------
+    - name: Display promotion parameters
+      ansible.builtin.debug:
+        msg: |
+          Promoting DC01 as first domain controller:
+            Domain: {{ ad_domain_name }}
+            NetBIOS: {{ ad_netbios_name }}
+            Forest Mode: {{ ad_forest_mode }}
+            Domain Mode: {{ ad_domain_mode }}
+
+    - name: Install AD DS Forest
+      ansible.windows.win_shell: |
+        $securePassword = ConvertTo-SecureString "{{ ad_safe_mode_password }}" -AsPlainText -Force
+        
+        $params = @{
+          DomainName                    = "{{ ad_domain_name }}"
+          DomainNetbiosName             = "{{ ad_netbios_name }}"
+          ForestMode                    = "{{ ad_forest_mode }}"
+          DomainMode                    = "{{ ad_domain_mode }}"
+          InstallDns                    = $true
+          CreateDnsDelegation           = $false
+          DatabasePath                  = "C:\Windows\NTDS"
+          LogPath                       = "C:\Windows\NTDS"
+          SysvolPath                    = "C:\Windows\SYSVOL"
+          SafeModeAdministratorPassword = $securePassword
+          NoRebootOnCompletion          = $false
+          Force                         = $true
+        }
+        
+        Install-ADDSForest @params
+      register: forest_install
+      async: 1800  # 30 minute timeout
+      poll: 30
+
+    # --------------------------------------------------------------------------
+    # Wait for Reboot
+    # --------------------------------------------------------------------------
+    - name: Wait for server to come back online
+      ansible.windows.win_wait_for_connection:
+        delay: 60
+        timeout: 600
+
+    - name: Wait for AD DS services to start
+      ansible.windows.win_shell: |
+        $maxAttempts = 30
+        $attempt = 0
+        
+        while ($attempt -lt $maxAttempts) {
+          $attempt++
+          try {
+            $domain = Get-ADDomain -ErrorAction Stop
+            Write-Output "AD DS is ready: $($domain.DNSRoot)"
+            exit 0
+          } catch {
+            Write-Output "Waiting for AD DS... (attempt $attempt/$maxAttempts)"
+            Start-Sleep -Seconds 10
+          }
+        }
+        
+        Write-Output "AD DS did not start in time"
+        exit 1
+      register: ad_ready
+      retries: 5
+      delay: 30
+      until: ad_ready.rc == 0
+
+    # --------------------------------------------------------------------------
+    # Post-Promotion Configuration
+    # --------------------------------------------------------------------------
+    - name: Configure DNS forwarders
+      ansible.windows.win_shell: |
+        $forwarders = @({{ dns_forwarders | map('quote') | join(', ') }})
+        Set-DnsServerForwarder -IPAddress $forwarders -PassThru
+      register: dns_forwarders_result
+
+    - name: Display DNS forwarders
+      ansible.builtin.debug:
+        var: dns_forwarders_result.stdout_lines
+
+    - name: Set Administrator password
+      ansible.windows.win_shell: |
+        $securePassword = ConvertTo-SecureString "{{ ad_admin_password }}" -AsPlainText -Force
+        Set-ADAccountPassword -Identity Administrator -NewPassword $securePassword -Reset
+        Write-Output "Administrator password set"
+      no_log: true
+
+    # --------------------------------------------------------------------------
+    # Verify Promotion
+    # --------------------------------------------------------------------------
+    - name: Verify domain controller status
+      ansible.windows.win_shell: |
+        $dc = Get-ADDomainController -Identity $env:COMPUTERNAME
+        $info = @{
+          Hostname = $dc.HostName
+          Domain = $dc.Domain
+          Forest = $dc.Forest
+          Site = $dc.Site
+          IsGlobalCatalog = $dc.IsGlobalCatalog
+          OperatingSystem = $dc.OperatingSystem
+          IPv4Address = $dc.IPv4Address
+        }
+        $info | ConvertTo-Json
+      register: dc_info
+
+    - name: Display domain controller info
+      ansible.builtin.debug:
+        var: dc_info.stdout | from_json
+
+    - name: Promotion complete
+      ansible.builtin.debug:
+        msg: |
+          DC01 has been promoted as the first domain controller.
+          
+          Domain: {{ ad_domain_name }}
+          NetBIOS: {{ ad_netbios_name }}
+          
+          Next steps:
+            1. Run 03-promote-dc02.yml to add second DC
+            2. Run 04-configure-sites.yml to create AD sites
+            3. Run 05-promote-dc03.yml to add replica DC

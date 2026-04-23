@@ -1,0 +1,59 @@
+h1. WorkSpaces Platform Pilot - Confluence Home
+
+h2. Page Purpose
+This page is the landing page for the WorkSpaces Platform Pilot implementation in AWS.
+
+h2. Project Summary
+* Project: WorkSpaces Platform Pilot
+* AWS Account: `111122223333`
+* Region: `us-east-1`
+* Directory: `workspaces-platform.local` (`d-0000000000`)
+* Infrastructure as Code: Terraform + Terragrunt
+* State Backend: S3 + DynamoDB + KMS
+
+h2. Documentation Tree
+Create child pages in this order:
+# `01-Architecture-and-Networking`
+# `02-Deployment-Runbook`
+# `03-Operations-and-Support`
+# `04-Configuration-Inventory`
+# `05-Standards-and-Well-Architected`
+
+h2. Scope
+This documentation covers:
+* Remote backend for shared Terraform/Terragrunt state
+* WorkSpaces personal tiers (Standard/SOC/Dev)
+* WorkSpaces pools (Standard/SOC/Dev)
+* Installs S3 bucket
+* Deployment scripts and operational workflows
+
+h2. High-Level Architecture
+{code:language=mermaid}
+flowchart TD
+  A["Terraform Backend<br/>(S3 + DynamoDB + KMS)"] --> B["Terragrunt Live Units"]
+  B --> C["WorkSpaces Personal Tiers<br/>(standard / soc / dev)"]
+  B --> D["WorkSpaces Pools<br/>(standard-pool / soc-pool / dev-pool)"]
+  B --> E["Installs S3 Bucket"]
+
+  C --> C1["Directory: workspaces-platform.local<br/>ID: d-0000000000"]
+  D --> D1["Directory: workspaces-platform.local<br/>ID: d-0000000000"]
+{code}
+
+h2. Quick Links (Repository Mapping)
+* Documentation index: `docs/README.md`
+* Root project overview: `README.md`
+* Backend runbook: `backend/README.md`
+* Standard tier runbook: `live/.../standard/README.md`
+* SOC tier runbook: `live/.../soc/README.md`
+* Dev tier runbook: `live/.../dev/README.md`
+* Standard pool runbook: `live/.../standard-pool/README.md`
+* SOC pool runbook: `live/.../soc-pool/README.md`
+* Dev pool runbook: `live/.../dev-pool/README.md`
+* Prerequisites: `PREREQUISITES.md`
+* Style guide: `STYLE_GUIDE.md`
+* Well-Architected checklist: `WELL_ARCHITECTED_CHECKLIST.md`
+
+h2. Change Management
+* All IaC changes go through PR review before apply in shared environments.
+* State locking is enabled via DynamoDB table.
+* Sensitive values are stored in AWS Secrets Manager and not committed in source.

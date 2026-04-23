@@ -1,0 +1,124 @@
+# ==============================================================================
+# PLAYBOOK: 05-move-workspace-to-ou-ssm.yml
+# Moves an existing WorkSpace computer to the WorkSpaces Computers OU
+#
+# This is needed for WorkSpaces created before the default_ou was configured.
+# New WorkSpaces will automatically be placed in the correct OU.
+#
+# Usage:
+#   ansible-playbook playbooks/05-move-workspace-to-ou-ssm.yml -e "computer_name=WSAMZN-XXXXXXXX"
+#
+# ==============================================================================
+---
+- name: Move WorkSpace Computer to WorkSpaces Computers OU
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+    computer_name: ""  # Must be provided via -e
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Validate Input
+    # --------------------------------------------------------------------------
+    - name: Validate computer name provided
+      ansible.builtin.fail:
+        msg: |
+          Computer name is required!
+          
+          Usage:
+            ansible-playbook playbooks/05-move-workspace-to-ou-ssm.yml -e "computer_name=WSAMZN-XXXXXXXX"
+          
+          To find the computer name, run on the WorkSpace:
+            hostname
+      when: computer_name == ""
+
+    # --------------------------------------------------------------------------
+    # Find and Move Computer
+    # --------------------------------------------------------------------------
+    - name: Find computer and move to OU
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["$computerName = \"{{ computer_name }}\"; $targetOU = \"{{ workspaces_computers_ou }}\"; try { $computer = Get-ADComputer -Identity $computerName -ErrorAction Stop; Write-Output \"Found computer: $($computer.DistinguishedName)\"; if ($computer.DistinguishedName -like \"*$targetOU*\") { Write-Output \"Computer is already in the correct OU\" } else { Move-ADObject -Identity $computer.DistinguishedName -TargetPath $targetOU; Write-Output \"Moved computer to: $targetOU\"; $computer = Get-ADComputer -Identity $computerName; Write-Output \"New location: $($computer.DistinguishedName)\" } } catch { Write-Output \"ERROR: Computer not found: $computerName\"; exit 1 }"]'
+          --output json
+      register: move_cmd
+
+    - name: Wait for move operation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (move_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: move_result
+      until: "(move_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 8
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: "{{ (move_result.stdout | from_json)[1] }}"
+
+    - name: Check for errors
+      ansible.builtin.fail:
+        msg: "Move failed: {{ (move_result.stdout | from_json)[2] }}"
+      when: "(move_result.stdout | from_json)[0] == 'Failed'"
+
+    # --------------------------------------------------------------------------
+    # Force Replication
+    # --------------------------------------------------------------------------
+    - name: Force AD replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["repadmin /syncall /A /e /P | Out-Null; Write-Output \"Replication initiated\""]'
+          --output json
+      register: repl_cmd
+
+    - name: Wait for replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (repl_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: repl_result
+      until: repl_result is succeeded
+      retries: 10
+      delay: 5
+
+    # --------------------------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------------------------
+    - name: Operation complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          WORKSPACE COMPUTER MOVED
+          ============================================
+          
+          Computer: {{ computer_name }}
+          Target OU: {{ workspaces_computers_ou }}
+          
+          Next steps on the WorkSpace:
+            1. Run: gpupdate /force
+            2. Or reboot the WorkSpace
+          
+          The GPOs linked to the OU will now apply.
+          ============================================

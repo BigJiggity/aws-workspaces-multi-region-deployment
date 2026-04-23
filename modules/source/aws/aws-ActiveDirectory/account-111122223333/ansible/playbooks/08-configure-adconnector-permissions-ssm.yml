@@ -1,0 +1,331 @@
+# ==============================================================================
+# PLAYBOOK: 08-configure-adconnector-permissions-ssm.yml
+# Sets up least-privilege permissions for AWS AD Connector service account
+#
+# This playbook:
+#   1. Resets svc_adconnector password
+#   2. Creates OU for WorkSpaces computers
+#   3. Delegates proper permissions (least privilege)
+#   4. Removes svc_adconnector from Domain Admins
+#
+# AWS AD Connector required permissions:
+#   - Read users and groups
+#   - Create/delete computer objects in designated OU
+#   - Join computers to domain
+#   - Reset user passwords (for WorkSpaces)
+#
+# Run: ansible-playbook playbooks/08-configure-adconnector-permissions-ssm.yml
+# ==============================================================================
+---
+- name: Configure AD Connector Service Account with Least Privilege
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+    # OU where WorkSpaces/AD Connector will create computer objects
+    computers_ou: "OU=WorkSpaces Computers,DC=example,DC=internal"
+    users_ou: "OU=WorkSpaces Users,DC=example,DC=internal"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Reset svc_adconnector Password
+    # --------------------------------------------------------------------------
+    - name: Reset svc_adconnector password
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Set-ADAccountPassword -Identity svc_adconnector -NewPassword (ConvertTo-SecureString \"{{ svc_adconnector_password }}\" -AsPlainText -Force) -Reset; Set-ADUser -Identity svc_adconnector -PasswordNeverExpires $true; Write-Output \"Password reset for svc_adconnector\""]'
+          --output json
+      register: pwd_cmd
+
+    - name: Wait for password reset
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (pwd_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: pwd_result
+      until: "(pwd_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 10
+      delay: 5
+
+    - name: Display password reset result
+      ansible.builtin.debug:
+        msg: "{{ (pwd_result.stdout | from_json)[1] | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Create OUs for WorkSpaces
+    # --------------------------------------------------------------------------
+    - name: Create WorkSpaces Computers OU
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["$domain = (Get-ADDomain).DistinguishedName; try { Get-ADOrganizationalUnit -Identity \"OU=WorkSpaces Computers,$domain\" -ErrorAction Stop; Write-Output \"OU WorkSpaces Computers exists\" } catch { New-ADOrganizationalUnit -Name \"WorkSpaces Computers\" -Path $domain -Description \"Computer accounts created by AWS WorkSpaces\"; Write-Output \"Created OU WorkSpaces Computers\" }"]'
+          --output json
+      register: ou_cmd
+
+    - name: Wait for OU creation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (ou_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: ou_result
+      until: ou_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display OU result
+      ansible.builtin.debug:
+        msg: "{{ ou_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Remove from Domain Admins
+    # --------------------------------------------------------------------------
+    - name: Remove svc_adconnector from Domain Admins
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["try { Remove-ADGroupMember -Identity \"Domain Admins\" -Members svc_adconnector -Confirm:$false -ErrorAction Stop; Write-Output \"Removed svc_adconnector from Domain Admins\" } catch { Write-Output \"svc_adconnector not in Domain Admins (or already removed)\" }"]'
+          --output json
+      register: remove_da_cmd
+
+    - name: Wait for Domain Admins removal
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (remove_da_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: remove_da_result
+      until: remove_da_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display Domain Admins removal result
+      ansible.builtin.debug:
+        msg: "{{ remove_da_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Delegate Permissions on WorkSpaces Computers OU
+    # Permissions needed:
+    #   - Create/Delete Computer Objects
+    #   - Read/Write all properties of Computer Objects
+    #   - Reset Password
+    #   - Change Password
+    #   - Validated write to DNS host name
+    #   - Validated write to service principal name
+    # --------------------------------------------------------------------------
+    - name: Delegate permissions on WorkSpaces Computers OU
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 120
+          --parameters commands='["$ErrorActionPreference = \"Stop\"; Import-Module ActiveDirectory; $ouDN = \"OU=WorkSpaces Computers,DC=example,DC=internal\"; $account = \"ORG\\svc_adconnector\"; $acl = Get-Acl \"AD:\\$ouDN\"; $computerGuid = [GUID]\"bf967a86-0de6-11d0-a285-00aa003049e2\"; $allGuid = [GUID]\"00000000-0000-0000-0000-000000000000\"; $dnsHostNameGuid = [GUID]\"72e39547-7b18-11d1-adef-00c04fd8d5cd\"; $spnGuid = [GUID]\"f3a64788-5306-11d1-a9c5-0000f80367c1\"; $userAccountControlGuid = [GUID]\"bf967a68-0de6-11d0-a285-00aa003049e2\"; $sid = (Get-ADUser -Identity svc_adconnector).SID; $ace1 = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, \"CreateChild,DeleteChild\", \"Allow\", $computerGuid, \"All\"); $acl.AddAccessRule($ace1); $ace2 = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, \"GenericAll\", \"Allow\", \"Descendents\", $computerGuid); $acl.AddAccessRule($ace2); $ace3 = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, \"Self\", \"Allow\", $dnsHostNameGuid, \"Descendents\", $computerGuid); $acl.AddAccessRule($ace3); $ace4 = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, \"Self\", \"Allow\", $spnGuid, \"Descendents\", $computerGuid); $acl.AddAccessRule($ace4); Set-Acl \"AD:\\$ouDN\" $acl; Write-Output \"Delegated computer management permissions on WorkSpaces Computers OU\""]'
+          --output json
+      register: delegate_computers_cmd
+
+    - name: Wait for computer OU delegation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (delegate_computers_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: delegate_computers_result
+      until: "(delegate_computers_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 5
+
+    - name: Display computer delegation result
+      ansible.builtin.debug:
+        msg: "{{ (delegate_computers_result.stdout | from_json)[1] | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Delegate Read Permissions on Domain Root (for user lookups)
+    # --------------------------------------------------------------------------
+    - name: Grant read permissions on domain for user lookups
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 120
+          --parameters commands='["$ErrorActionPreference = \"Stop\"; Import-Module ActiveDirectory; $domainDN = (Get-ADDomain).DistinguishedName; $account = \"ORG\\svc_adconnector\"; $acl = Get-Acl \"AD:\\$domainDN\"; $sid = (Get-ADUser -Identity svc_adconnector).SID; $userGuid = [GUID]\"bf967aba-0de6-11d0-a285-00aa003049e2\"; $groupGuid = [GUID]\"bf967a9c-0de6-11d0-a285-00aa003049e2\"; $ace1 = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, \"GenericRead\", \"Allow\", \"Descendents\", $userGuid); $acl.AddAccessRule($ace1); $ace2 = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, \"GenericRead\", \"Allow\", \"Descendents\", $groupGuid); $acl.AddAccessRule($ace2); Set-Acl \"AD:\\$domainDN\" $acl; Write-Output \"Granted read permissions on domain for user and group lookups\""]'
+          --output json
+      register: delegate_read_cmd
+
+    - name: Wait for read delegation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (delegate_read_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: delegate_read_result
+      until: "(delegate_read_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 5
+
+    - name: Display read delegation result
+      ansible.builtin.debug:
+        msg: "{{ (delegate_read_result.stdout | from_json)[1] | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Delegate Password Reset on WorkSpaces Users OU
+    # --------------------------------------------------------------------------
+    - name: Delegate password reset on WorkSpaces Users OU
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 120
+          --parameters commands='["$ErrorActionPreference = \"Stop\"; Import-Module ActiveDirectory; $ouDN = \"OU=WorkSpaces Users,DC=example,DC=internal\"; try { Get-ADOrganizationalUnit -Identity $ouDN -ErrorAction Stop } catch { Write-Output \"WorkSpaces Users OU does not exist, skipping\"; exit 0 }; $acl = Get-Acl \"AD:\\$ouDN\"; $sid = (Get-ADUser -Identity svc_adconnector).SID; $userGuid = [GUID]\"bf967aba-0de6-11d0-a285-00aa003049e2\"; $resetPwdGuid = [GUID]\"00299570-246d-11d0-a768-00aa006e0529\"; $ace1 = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, \"ExtendedRight\", \"Allow\", $resetPwdGuid, \"Descendents\", $userGuid); $acl.AddAccessRule($ace1); Set-Acl \"AD:\\$ouDN\" $acl; Write-Output \"Delegated password reset on WorkSpaces Users OU\""]'
+          --output json
+      register: delegate_pwd_cmd
+
+    - name: Wait for password delegation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (delegate_pwd_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: delegate_pwd_result
+      until: "(delegate_pwd_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 5
+
+    - name: Display password delegation result
+      ansible.builtin.debug:
+        msg: "{{ (delegate_pwd_result.stdout | from_json)[1] | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Force Replication
+    # --------------------------------------------------------------------------
+    - name: Force AD replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["repadmin /syncall /A /e /P; Write-Output \"Replication initiated\""]'
+          --output json
+      register: repl_cmd
+
+    - name: Wait for replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (repl_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: repl_result
+      until: repl_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Wait for replication to complete
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting 30 seconds for cross-region replication..."
+
+    # --------------------------------------------------------------------------
+    # Verify Permissions
+    # --------------------------------------------------------------------------
+    - name: Verify svc_adconnector permissions
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Write-Output \"=== svc_adconnector Account ===\"; Get-ADUser svc_adconnector -Properties MemberOf,Description | Format-List Name,Description; Write-Output \"\n=== Group Memberships ===\"; (Get-ADUser svc_adconnector -Properties MemberOf).MemberOf | ForEach-Object { ($_ -split \",\")[0] -replace \"CN=\",\"\" }; Write-Output \"\n=== Delegated Permissions on WorkSpaces Computers OU ===\"; $acl = Get-Acl \"AD:\\OU=WorkSpaces Computers,DC=example,DC=internal\"; $acl.Access | Where-Object { $_.IdentityReference -like \"*svc_adconnector*\" } | Format-Table IdentityReference,ActiveDirectoryRights,AccessControlType -AutoSize"]'
+          --output json
+      register: verify_cmd
+
+    - name: Wait for verification
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (verify_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: verify_result
+      until: verify_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display verification
+      ansible.builtin.debug:
+        msg: "{{ verify_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------------------------
+    - name: Configuration complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          AD CONNECTOR PERMISSIONS CONFIGURED
+          ============================================
+          
+          Service Account: svc_adconnector
+          Password: {{ svc_adconnector_password }}
+          
+          Permissions Granted (Least Privilege):
+            ✓ Removed from Domain Admins
+            ✓ Create/Delete computer objects in:
+              OU=WorkSpaces Computers,DC=example,DC=internal
+            ✓ Full control of computer objects (join domain)
+            ✓ Read users and groups domain-wide
+            ✓ Reset passwords in:
+              OU=WorkSpaces Users,DC=example,DC=internal
+          
+          AD Connector Configuration:
+            Directory DNS: example.internal
+            DNS IPs: {{ dc03.private_ip }}, {{ dc01.private_ip }}
+            Username: svc_adconnector
+            Password: {{ svc_adconnector_password }}
+            Computer OU: OU=WorkSpaces Computers,DC=example,DC=internal
+          
+          ============================================

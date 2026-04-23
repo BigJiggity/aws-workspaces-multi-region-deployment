@@ -1,5 +1,7 @@
 # Local .terraform directories
 .terraform/
+.terragrunt-cache/
+terragrunt-debug.tfvars
 
 # .tfstate files
 *.tfstate
@@ -31,7 +33,40 @@ override.tf.json
 
 # Include tfplan files to ignore the plan output of command: terraform plan -out=tfplan
 # example: *tfplan*
+tfplan
+*.tfplan
+plan.out
 
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
+
+# Local environment and deployment config
+.env
+.env.*
+config/deployment.env
+
+# Ansible local runtime artifacts
+.ansible/
+ansible.log
+*.retry
+
+# Common key/certificate artifacts
+*.pem
+*.key
+*.csr
+*.crt
+*.p12
+*.pfx
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor/OS artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

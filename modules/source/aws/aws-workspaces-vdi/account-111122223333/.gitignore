@@ -1,0 +1,42 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Ansible
+ansible/.ansible_cache/
+ansible/*.retry
+ansible/ansible.log
+ansible/**/secrets.yml
+ansible/.vault_pass*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (NEVER commit these)
+secrets.yml
+**/secrets.yml
+*.secret
+*.credentials
+
+# Local overrides
+*.local
+*.local.*

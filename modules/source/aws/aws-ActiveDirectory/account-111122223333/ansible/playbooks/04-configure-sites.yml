@@ -1,0 +1,239 @@
+# ==============================================================================
+# PLAYBOOK: 04-configure-sites.yml
+# Configures AD Sites and Services for multi-region deployment
+#
+# Prerequisites:
+#   - DC01 and DC02 must be promoted
+#
+# Run: ansible-playbook playbooks/04-configure-sites.yml
+# ==============================================================================
+---
+- name: Configure AD Sites and Services
+  hosts: dc01
+  gather_facts: true
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Verify AD DS is Running
+    # --------------------------------------------------------------------------
+    - name: Verify AD DS is operational
+      ansible.windows.win_shell: |
+        $domain = Get-ADDomain
+        Write-Output "Domain: $($domain.DNSRoot)"
+      register: ad_check
+      failed_when: ad_check.rc != 0
+
+    # --------------------------------------------------------------------------
+    # Create AD Sites
+    # --------------------------------------------------------------------------
+    - name: Create US-East-2 site
+      ansible.windows.win_shell: |
+        $siteName = "US-East-2"
+        $site = Get-ADReplicationSite -Filter "Name -eq '$siteName'" -ErrorAction SilentlyContinue
+        
+        if ($site) {
+          Write-Output "Site '$siteName' already exists"
+        } else {
+          New-ADReplicationSite -Name $siteName -Description "Primary site in AWS US-East-2 region"
+          Write-Output "Created site '$siteName'"
+        }
+      register: site_use2
+
+    - name: Display US-East-2 site result
+      ansible.builtin.debug:
+        var: site_use2.stdout
+
+    - name: Create AP-Southeast-1 site
+      ansible.windows.win_shell: |
+        $siteName = "AP-Southeast-1"
+        $site = Get-ADReplicationSite -Filter "Name -eq '$siteName'" -ErrorAction SilentlyContinue
+        
+        if ($site) {
+          Write-Output "Site '$siteName' already exists"
+        } else {
+          New-ADReplicationSite -Name $siteName -Description "Replica site in AWS AP-Southeast-1 region"
+          Write-Output "Created site '$siteName'"
+        }
+      register: site_apse1
+
+    - name: Display AP-Southeast-1 site result
+      ansible.builtin.debug:
+        var: site_apse1.stdout
+
+    # --------------------------------------------------------------------------
+    # Create AD Subnets
+    # --------------------------------------------------------------------------
+    - name: Create subnet for US-East-2 VPC
+      ansible.windows.win_shell: |
+        $subnetCIDR = "10.0.0.0/16"
+        $siteName = "US-East-2"
+        
+        $subnet = Get-ADReplicationSubnet -Filter "Name -eq '$subnetCIDR'" -ErrorAction SilentlyContinue
+        
+        if ($subnet) {
+          Write-Output "Subnet '$subnetCIDR' already exists"
+        } else {
+          New-ADReplicationSubnet -Name $subnetCIDR -Site $siteName -Description "AWS US-East-2 VPC"
+          Write-Output "Created subnet '$subnetCIDR' in site '$siteName'"
+        }
+      register: subnet_use2
+
+    - name: Display US-East-2 subnet result
+      ansible.builtin.debug:
+        var: subnet_use2.stdout
+
+    - name: Create subnet for AP-Southeast-1 VPC
+      ansible.windows.win_shell: |
+        $subnetCIDR = "10.2.0.0/16"
+        $siteName = "AP-Southeast-1"
+        
+        $subnet = Get-ADReplicationSubnet -Filter "Name -eq '$subnetCIDR'" -ErrorAction SilentlyContinue
+        
+        if ($subnet) {
+          Write-Output "Subnet '$subnetCIDR' already exists"
+        } else {
+          New-ADReplicationSubnet -Name $subnetCIDR -Site $siteName -Description "AWS AP-Southeast-1 VPC"
+          Write-Output "Created subnet '$subnetCIDR' in site '$siteName'"
+        }
+      register: subnet_apse1
+
+    - name: Display AP-Southeast-1 subnet result
+      ansible.builtin.debug:
+        var: subnet_apse1.stdout
+
+    # --------------------------------------------------------------------------
+    # Create Site Link
+    # --------------------------------------------------------------------------
+    - name: Create site link between regions
+      ansible.windows.win_shell: |
+        $linkName = "US-East-2-to-AP-Southeast-1"
+        $sites = @("US-East-2", "AP-Southeast-1")
+        $cost = 100
+        $replicationFrequency = 15  # minutes
+        
+        $link = Get-ADReplicationSiteLink -Filter "Name -eq '$linkName'" -ErrorAction SilentlyContinue
+        
+        if ($link) {
+          # Update existing link
+          Set-ADReplicationSiteLink -Identity $linkName -Cost $cost -ReplicationFrequencyInMinutes $replicationFrequency
+          Write-Output "Updated site link '$linkName'"
+        } else {
+          # Create new link
+          New-ADReplicationSiteLink -Name $linkName -SitesIncluded $sites -Cost $cost -ReplicationFrequencyInMinutes $replicationFrequency -InterSiteTransportProtocol IP
+          Write-Output "Created site link '$linkName'"
+        }
+        
+        # Remove default site link if sites are moved
+        $defaultLink = Get-ADReplicationSiteLink -Filter "Name -eq 'DEFAULTIPSITELINK'" -ErrorAction SilentlyContinue
+        if ($defaultLink) {
+          Write-Output "Note: DEFAULTIPSITELINK still exists (can be removed after all DCs are in correct sites)"
+        }
+      register: site_link
+
+    - name: Display site link result
+      ansible.builtin.debug:
+        var: site_link.stdout
+
+    # --------------------------------------------------------------------------
+    # Move DC01 and DC02 to US-East-2 Site
+    # --------------------------------------------------------------------------
+    - name: Move DC01 to US-East-2 site
+      ansible.windows.win_shell: |
+        $dcName = "DC01"
+        $targetSite = "US-East-2"
+        
+        $dc = Get-ADDomainController -Identity $dcName -ErrorAction SilentlyContinue
+        if ($dc) {
+          $currentSite = $dc.Site
+          if ($currentSite -eq $targetSite) {
+            Write-Output "$dcName is already in site '$targetSite'"
+          } else {
+            Move-ADDirectoryServer -Identity $dcName -Site $targetSite
+            Write-Output "Moved $dcName from '$currentSite' to '$targetSite'"
+          }
+        } else {
+          Write-Output "$dcName not found"
+        }
+      register: move_dc01
+
+    - name: Display DC01 move result
+      ansible.builtin.debug:
+        var: move_dc01.stdout
+
+    - name: Move DC02 to US-East-2 site
+      ansible.windows.win_shell: |
+        $dcName = "DC02"
+        $targetSite = "US-East-2"
+        
+        $dc = Get-ADDomainController -Identity $dcName -ErrorAction SilentlyContinue
+        if ($dc) {
+          $currentSite = $dc.Site
+          if ($currentSite -eq $targetSite) {
+            Write-Output "$dcName is already in site '$targetSite'"
+          } else {
+            Move-ADDirectoryServer -Identity $dcName -Site $targetSite
+            Write-Output "Moved $dcName from '$currentSite' to '$targetSite'"
+          }
+        } else {
+          Write-Output "$dcName not found (may not be promoted yet)"
+        }
+      register: move_dc02
+      ignore_errors: true
+
+    - name: Display DC02 move result
+      ansible.builtin.debug:
+        var: move_dc02.stdout
+
+    # --------------------------------------------------------------------------
+    # Verify Configuration
+    # --------------------------------------------------------------------------
+    - name: List all sites
+      ansible.windows.win_shell: |
+        Get-ADReplicationSite -Filter * | Select-Object Name, Description | Format-Table -AutoSize | Out-String
+      register: all_sites
+
+    - name: Display all sites
+      ansible.builtin.debug:
+        var: all_sites.stdout_lines
+
+    - name: List all subnets
+      ansible.windows.win_shell: |
+        Get-ADReplicationSubnet -Filter * | Select-Object Name, Site | Format-Table -AutoSize | Out-String
+      register: all_subnets
+
+    - name: Display all subnets
+      ansible.builtin.debug:
+        var: all_subnets.stdout_lines
+
+    - name: List all site links
+      ansible.windows.win_shell: |
+        Get-ADReplicationSiteLink -Filter * | Select-Object Name, Cost, ReplicationFrequencyInMinutes, SitesIncluded | Format-List | Out-String
+      register: all_links
+
+    - name: Display all site links
+      ansible.builtin.debug:
+        var: all_links.stdout_lines
+
+    - name: List domain controllers and their sites
+      ansible.windows.win_shell: |
+        Get-ADDomainController -Filter * | Select-Object Name, Site, IPv4Address, IsGlobalCatalog | Format-Table -AutoSize | Out-String
+      register: all_dcs
+
+    - name: Display domain controllers
+      ansible.builtin.debug:
+        var: all_dcs.stdout_lines
+
+    - name: Sites configuration complete
+      ansible.builtin.debug:
+        msg: |
+          AD Sites and Services configuration complete.
+          
+          Sites created:
+            - US-East-2 (10.0.0.0/16)
+            - AP-Southeast-1 (10.2.0.0/16)
+          
+          Site Link:
+            - US-East-2-to-AP-Southeast-1 (cost: 100, replication: 15 min)
+          
+          Next step:
+            Run 05-promote-dc03.yml to add replica DC in AP-Southeast-1

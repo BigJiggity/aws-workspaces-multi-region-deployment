@@ -1,0 +1,203 @@
+# ==============================================================================
+# PLAYBOOK: 03-promote-dc02.yml
+# Promotes DC02 as an additional domain controller in US-East-2
+#
+# Prerequisites:
+#   - DC01 must be promoted and running
+#   - Run 01-prepare-servers.yml first
+#
+# Run: ansible-playbook playbooks/03-promote-dc02.yml
+# ==============================================================================
+---
+- name: Promote DC02 as Additional Domain Controller
+  hosts: dc02
+  gather_facts: true
+
+  pre_tasks:
+    - name: Validate required passwords are set
+      ansible.builtin.assert:
+        that:
+          - ad_safe_mode_password | length > 0
+          - ad_admin_password | length > 0
+        fail_msg: |
+          Required passwords not set. Please set environment variables:
+            export AD_SAFE_MODE_PASSWORD="YourPassword"
+            export AD_ADMIN_PASSWORD="YourPassword"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Check Current State
+    # --------------------------------------------------------------------------
+    - name: Check if already a domain controller
+      ansible.windows.win_shell: |
+        try {
+          $domain = Get-ADDomain -ErrorAction Stop
+          Write-Output "ALREADY_DC:$($domain.DNSRoot)"
+        } catch {
+          Write-Output "NOT_A_DC"
+        }
+      register: dc_check
+      ignore_errors: true
+
+    - name: Skip if already a domain controller
+      ansible.builtin.meta: end_play
+      when: "'ALREADY_DC' in dc_check.stdout"
+
+    # --------------------------------------------------------------------------
+    # Configure DNS to Point to DC01
+    # --------------------------------------------------------------------------
+    - name: Get DC01 IP address from Terraform outputs
+      ansible.builtin.set_fact:
+        dc01_ip: "{{ hostvars['dc01']['ansible_host'] | default('') }}"
+
+    - name: Get DC01 IP via AWS SSM if not set
+      ansible.windows.win_shell: |
+        # Try to resolve DC01 or use the known management subnet
+        $dc01Name = "dc01.{{ ad_domain_name }}"
+        try {
+          $resolved = Resolve-DnsName -Name $dc01Name -ErrorAction Stop
+          Write-Output $resolved.IPAddress
+        } catch {
+          # Fallback: scan management subnet for DC01
+          # DC01 should be in 10.0.12.x subnet
+          $subnet = "10.0.12"
+          for ($i = 1; $i -lt 255; $i++) {
+            $ip = "$subnet.$i"
+            if (Test-NetConnection -ComputerName $ip -Port 389 -WarningAction SilentlyContinue -InformationLevel Quiet) {
+              Write-Output $ip
+              break
+            }
+          }
+        }
+      register: dc01_lookup
+      when: dc01_ip | length == 0
+
+    - name: Set DC01 IP from lookup
+      ansible.builtin.set_fact:
+        dc01_ip: "{{ dc01_lookup.stdout | trim }}"
+      when: dc01_lookup is defined and dc01_lookup.stdout is defined
+
+    - name: Configure DNS client to use DC01
+      ansible.windows.win_shell: |
+        $adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Name -notlike '*Loopback*' } | Select-Object -First 1
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses "{{ dc01_ip }}"
+        Write-Output "DNS set to {{ dc01_ip }}"
+
+    - name: Verify DNS connectivity to DC01
+      ansible.windows.win_shell: |
+        $result = Resolve-DnsName -Name "{{ ad_domain_name }}" -Type SOA -ErrorAction Stop
+        Write-Output "DNS resolution successful: $($result.Name)"
+      register: dns_test
+      retries: 3
+      delay: 10
+      until: dns_test.rc == 0
+
+    # --------------------------------------------------------------------------
+    # Join Domain and Promote
+    # --------------------------------------------------------------------------
+    - name: Display promotion parameters
+      ansible.builtin.debug:
+        msg: |
+          Promoting DC02 as additional domain controller:
+            Domain: {{ ad_domain_name }}
+            Site: {{ ad_site_name }}
+            DC01 IP: {{ dc01_ip }}
+
+    - name: Promote as additional domain controller
+      ansible.windows.win_shell: |
+        $securePassword = ConvertTo-SecureString "{{ ad_admin_password }}" -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential("{{ ad_netbios_name }}\Administrator", $securePassword)
+        $safeModePassword = ConvertTo-SecureString "{{ ad_safe_mode_password }}" -AsPlainText -Force
+        
+        $params = @{
+          DomainName                    = "{{ ad_domain_name }}"
+          Credential                    = $credential
+          InstallDns                    = $true
+          CreateDnsDelegation           = $false
+          DatabasePath                  = "C:\Windows\NTDS"
+          LogPath                       = "C:\Windows\NTDS"
+          SysvolPath                    = "C:\Windows\SYSVOL"
+          SafeModeAdministratorPassword = $safeModePassword
+          NoRebootOnCompletion          = $false
+          Force                         = $true
+        }
+        
+        Install-ADDSDomainController @params
+      register: dc_install
+      async: 1800
+      poll: 30
+      no_log: true
+
+    # --------------------------------------------------------------------------
+    # Wait for Reboot
+    # --------------------------------------------------------------------------
+    - name: Wait for server to come back online
+      ansible.windows.win_wait_for_connection:
+        delay: 60
+        timeout: 600
+
+    - name: Wait for AD DS services to start
+      ansible.windows.win_shell: |
+        $maxAttempts = 30
+        $attempt = 0
+        
+        while ($attempt -lt $maxAttempts) {
+          $attempt++
+          try {
+            $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop
+            Write-Output "AD DS is ready: $($dc.HostName)"
+            exit 0
+          } catch {
+            Write-Output "Waiting for AD DS... (attempt $attempt/$maxAttempts)"
+            Start-Sleep -Seconds 10
+          }
+        }
+        
+        Write-Output "AD DS did not start in time"
+        exit 1
+      register: ad_ready
+      retries: 5
+      delay: 30
+      until: ad_ready.rc == 0
+
+    # --------------------------------------------------------------------------
+    # Verify Promotion
+    # --------------------------------------------------------------------------
+    - name: Verify domain controller status
+      ansible.windows.win_shell: |
+        $dc = Get-ADDomainController -Identity $env:COMPUTERNAME
+        $info = @{
+          Hostname = $dc.HostName
+          Domain = $dc.Domain
+          Forest = $dc.Forest
+          Site = $dc.Site
+          IsGlobalCatalog = $dc.IsGlobalCatalog
+          IPv4Address = $dc.IPv4Address
+        }
+        $info | ConvertTo-Json
+      register: dc_info
+
+    - name: Display domain controller info
+      ansible.builtin.debug:
+        var: dc_info.stdout | from_json
+
+    - name: Verify replication with DC01
+      ansible.windows.win_shell: |
+        repadmin /replsummary
+      register: repl_summary
+
+    - name: Display replication summary
+      ansible.builtin.debug:
+        var: repl_summary.stdout_lines
+
+    - name: Promotion complete
+      ansible.builtin.debug:
+        msg: |
+          DC02 has been promoted as an additional domain controller.
+          
+          Domain: {{ ad_domain_name }}
+          Site: {{ ad_site_name }}
+          
+          Next steps:
+            1. Run 04-configure-sites.yml to create AD sites
+            2. Run 05-promote-dc03.yml to add replica DC

@@ -1,0 +1,89 @@
+# ==============================================================================
+# AD USER DEFINITIONS
+# Add users to this file to create them in Active Directory
+#
+# Required fields:
+#   - username: SAM account name (login name)
+#   - display_name: Full display name
+#   - password: Initial password (user should change on first login)
+#
+# Optional fields:
+#   - email: Email address
+#   - ou: Organizational Unit (default: CN=Users,DC=example,DC=internal)
+#   - groups: List of AD groups to add user to
+#   - description: User description
+#   - department: Department name
+#   - title: Job title
+#   - manager: Manager's username
+#   - password_never_expires: true/false (default: false)
+#   - must_change_password: true/false (default: true)
+#   - enabled: true/false (default: true)
+#
+# Usage:
+#   ansible-playbook user-management/manage-users.yml
+#   ansible-playbook user-management/manage-users.yml -e "action=delete"
+#   ansible-playbook user-management/manage-users.yml -e "action=disable"
+# ==============================================================================
+---
+# ==============================================================================
+# USER PASSWORD MANAGEMENT
+#
+# Option 1: Pass password via command line (recommended for one-off changes)
+#   ansible-playbook user-management/manage-users.yml -e "default_password=NewPassword123"
+#
+# Option 2: Load from AWS Secrets Manager (for existing users)
+#   User passwords stored in: org-infrastructure/credentials
+#   Key format: <username>_password (e.g., rochellec_password)
+#
+# Option 3: Environment variable
+#   export USER_PASSWORD="SecurePassword123"
+#   ansible-playbook user-management/manage-users.yml
+# ==============================================================================
+
+# Default password - override with -e "default_password=xxx"
+default_password: "{{ lookup('env', 'USER_PASSWORD') | default('ChangeMe123!', true) }}"
+
+ad_users:
+  - username: rochellec
+    display_name: "Rochelle C"
+    password: "{{ default_password }}"
+    email: "rochellec@example.internal"
+    groups:
+      - "Domain Users"
+      - "WorkSpaces-LocalAdmins"
+    description: "Standard user account"
+    must_change_password: false
+    
+  - username: wsuser
+    display_name: "Workspace user"
+    password: "{{ default_password }}"
+    email: "newuser@example.internal"
+    department: "Systems Architecture"
+    groups:
+      - "Domain Users"
+      - "WorksSpaces-LocalAdmins"
+    must_change_password: false
+    
+  # Example users - uncomment and modify as needed
+  # - username: jsmith
+  #   display_name: "John Smith"
+  #   password: "TempP@ss123!"
+  #   email: "jsmith@example.internal"
+  #   department: "Engineering"
+  #   title: "Software Engineer"
+  #   groups:
+  #     - "Domain Users"
+  #     - "VPN Users"
+  #   must_change_password: true
+  #
+  # - username: admin.john
+  #   display_name: "John Admin"
+  #   password: "Adm1nP@ss!"
+  #   email: "admin.john@example.internal"
+  #   ou: "OU=Admins,DC=example,DC=internal"
+  #   groups:
+  #     - "Domain Admins"
+  #     - "Enterprise Admins"
+  #   description: "Administrative account"
+  #   password_never_expires: true
+  #   must_change_password: false

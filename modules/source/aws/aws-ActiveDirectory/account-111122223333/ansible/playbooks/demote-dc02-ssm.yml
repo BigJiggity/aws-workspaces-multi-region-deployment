@@ -1,0 +1,281 @@
+# ==============================================================================
+# PLAYBOOK: demote-dc02-ssm.yml
+# Demotes DC02 from Domain Controller and removes it from the domain
+#
+# This playbook:
+#   1. Verifies replication health
+#   2. Checks FSMO roles (ensures DC02 doesn't hold any)
+#   3. Demotes DC02 using Uninstall-ADDSDomainController
+#   4. Removes DC02 from the domain
+#
+# IMPORTANT: Run this BEFORE destroying DC02 in Terraform!
+#
+# Usage:
+#   cd ~/Repos/cloud_infrastructure/account-111122223333/ansible
+#   ansible-playbook playbooks/demote-dc02-ssm.yml -v
+#
+# ==============================================================================
+---
+- name: Demote DC02 Domain Controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+    dc02_instance_id: "i-06be6d78fcd450fe8"
+    dc02_region: "us-east-2"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Load Secrets
+    # --------------------------------------------------------------------------
+    - name: Load secrets from AWS Secrets Manager
+      include_tasks: load-secrets.yml
+
+    # --------------------------------------------------------------------------
+    # Step 1: Verify Replication Health from DC01
+    # --------------------------------------------------------------------------
+    - name: Check AD replication health
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 120
+          --parameters commands='["Write-Output \"=== REPLICATION STATUS ===\"; repadmin /replsummary; Write-Output \"\"; Write-Output \"=== REPLICATION QUEUE ===\"; repadmin /queue"]'
+          --output json
+      register: repl_check_cmd
+
+    - name: Wait for replication check
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (repl_check_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: repl_check_result
+      until: "(repl_check_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 10
+
+    - name: Display replication status
+      ansible.builtin.debug:
+        msg: "{{ (repl_check_result.stdout | from_json)[1] }}"
+
+    # --------------------------------------------------------------------------
+    # Step 2: Check FSMO Roles
+    # --------------------------------------------------------------------------
+    - name: Check FSMO role holders
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 60
+          --parameters commands='["Write-Output \"=== FSMO ROLE HOLDERS ===\"; netdom query fsmo"]'
+          --output json
+      register: fsmo_cmd
+
+    - name: Wait for FSMO check
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (fsmo_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: fsmo_result
+      until: "(fsmo_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 10
+      delay: 5
+
+    - name: Display FSMO roles
+      ansible.builtin.debug:
+        msg: "{{ (fsmo_result.stdout | from_json)[1] }}"
+
+    - name: Check if DC02 holds any FSMO roles
+      ansible.builtin.set_fact:
+        dc02_has_fsmo: "{{ 'DC02' in (fsmo_result.stdout | from_json)[1] }}"
+
+    - name: WARN if DC02 holds FSMO roles
+      ansible.builtin.debug:
+        msg: |
+          ⚠️  WARNING: DC02 appears to hold FSMO roles!
+          Transfer roles to DC01 before proceeding:
+            Move-ADDirectoryServerOperationMasterRole -Identity DC01 -OperationMasterRole SchemaMaster,DomainNamingMaster,PDCEmulator,RIDMaster,InfrastructureMaster
+      when: dc02_has_fsmo
+
+    # --------------------------------------------------------------------------
+    # Step 3: Confirmation
+    # --------------------------------------------------------------------------
+    - name: Confirm demotion
+      ansible.builtin.pause:
+        prompt: |
+          
+          ============================================
+          DC02 DEMOTION CONFIRMATION
+          ============================================
+          
+          DC02 Instance: {{ dc02_instance_id }}
+          IP Address: 10.0.13.10
+          Region: {{ dc02_region }}
+          
+          This will:
+            1. Demote DC02 from Domain Controller
+            2. Remove AD DS role
+            3. Reboot the server
+          
+          After this, you should:
+            1. Run terraform to destroy the EC2 instance
+            2. Deploy new DC02 in us-east-1
+          
+          Press Enter to continue or Ctrl+C to abort...
+
+    # --------------------------------------------------------------------------
+    # Step 4: Demote DC02
+    # --------------------------------------------------------------------------
+    - name: Demote DC02 Domain Controller
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc02_region }}
+          --instance-ids {{ dc02_instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 600
+          --parameters commands='["$password = ConvertTo-SecureString \"{{ ad_admin_password }}\" -AsPlainText -Force; Write-Output \"Starting DC02 demotion...\"; try { Uninstall-ADDSDomainController -LocalAdministratorPassword $password -DemoteOperationMasterRole -RemoveApplicationPartitions -Force -NoRebootOnCompletion; Write-Output \"Demotion completed successfully\"; Write-Output \"Rebooting server...\"; Restart-Computer -Force } catch { Write-Output \"ERROR: $($_.Exception.Message)\"; exit 1 }"]'
+          --output json
+      register: demote_cmd
+      no_log: true
+
+    - name: Wait for demotion (this takes several minutes)
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc02_region }}
+          --command-id {{ (demote_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02_instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: demote_result
+      until: "(demote_result.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut']"
+      retries: 60
+      delay: 15
+
+    - name: Display demotion result
+      ansible.builtin.debug:
+        msg: "{{ (demote_result.stdout | from_json)[1] }}"
+
+    - name: Check for demotion errors
+      ansible.builtin.debug:
+        msg: "Errors: {{ (demote_result.stdout | from_json)[2] }}"
+      when: "(demote_result.stdout | from_json)[2] | length > 0"
+
+    # --------------------------------------------------------------------------
+    # Step 5: Wait for reboot
+    # --------------------------------------------------------------------------
+    - name: Wait for DC02 to reboot
+      ansible.builtin.pause:
+        seconds: 120
+        prompt: "Waiting 2 minutes for DC02 to reboot..."
+
+    # --------------------------------------------------------------------------
+    # Step 6: Verify demotion from DC01
+    # --------------------------------------------------------------------------
+    - name: Verify DC02 is no longer a DC
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 60
+          --parameters commands='["Write-Output \"=== CURRENT DOMAIN CONTROLLERS ===\"; Get-ADDomainController -Filter * | Format-Table Name,IPv4Address,Site,IsGlobalCatalog -AutoSize"]'
+          --output json
+      register: verify_cmd
+
+    - name: Wait for verification
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (verify_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: verify_result
+      until: "(verify_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 10
+
+    - name: Display current DCs
+      ansible.builtin.debug:
+        msg: "{{ (verify_result.stdout | from_json)[1] }}"
+
+    # --------------------------------------------------------------------------
+    # Step 7: Clean up AD metadata (if needed)
+    # --------------------------------------------------------------------------
+    - name: Clean up DC02 metadata from AD
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 120
+          --parameters '{"commands":["$dc02 = Get-ADComputer -Filter \"Name -eq ''DC02''\" -ErrorAction SilentlyContinue; if ($dc02) { $isDC = Get-ADDomainController -Filter \"Name -eq ''DC02''\" -ErrorAction SilentlyContinue; if (-not $isDC) { Write-Output \"DC02 is no longer a DC. Metadata cleanup not needed.\" } else { Write-Output \"WARNING: DC02 still appears as a DC. Manual metadata cleanup may be required.\" } } else { Write-Output \"DC02 computer account not found - may have been removed during demotion\" }"]}'
+          --output json
+      register: cleanup_cmd
+
+    - name: Wait for cleanup check
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (cleanup_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: cleanup_result
+      until: "(cleanup_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 10
+      delay: 5
+
+    - name: Display cleanup result
+      ansible.builtin.debug:
+        msg: "{{ (cleanup_result.stdout | from_json)[1] }}"
+
+    # --------------------------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------------------------
+    - name: Demotion complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          DC02 DEMOTION COMPLETE
+          ============================================
+          
+          DC02 has been demoted from Domain Controller.
+          
+          NEXT STEPS:
+          
+          1. Destroy DC02 in Terraform:
+             cd ~/Repos/cloud_infrastructure/account-111122223333
+             terraform plan -target=aws_instance.dc02 -destroy
+             terraform apply -target=aws_instance.dc02 -destroy
+          
+          2. Update Terraform to create DC02 in us-east-1
+          
+          3. Apply Terraform to create new DC02
+          
+          4. Promote new DC02 to Domain Controller
+          
+          ============================================

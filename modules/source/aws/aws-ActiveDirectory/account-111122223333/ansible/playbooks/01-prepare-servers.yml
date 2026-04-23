@@ -1,0 +1,242 @@
+# ==============================================================================
+# PLAYBOOK: 01-prepare-servers.yml
+# Prepares all Windows servers for AD DS role
+#
+# Run: ansible-playbook playbooks/01-prepare-servers.yml
+# ==============================================================================
+---
+- name: Prepare Windows Servers for Active Directory
+  hosts: domain_controllers
+  gather_facts: true
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # System Information
+    # --------------------------------------------------------------------------
+    - name: Display target server information
+      ansible.windows.win_shell: |
+        $info = [ordered]@{
+          ComputerName = $env:COMPUTERNAME
+          WindowsVersion = (Get-WmiObject Win32_OperatingSystem).Caption
+        }
+        $ips = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '169.*' }).IPAddress
+        $info.IPAddresses = $ips -join ', '
+        $info | ConvertTo-Json
+      register: server_info
+
+    - name: Show server info
+      ansible.builtin.debug:
+        var: server_info.stdout | from_json
+
+    # --------------------------------------------------------------------------
+    # Set Hostname
+    # --------------------------------------------------------------------------
+    - name: Set computer hostname
+      ansible.windows.win_hostname:
+        name: "{{ dc_hostname }}"
+      register: hostname_result
+
+    - name: Reboot if hostname changed
+      ansible.windows.win_reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        post_reboot_delay: "{{ post_reboot_delay }}"
+      when: hostname_result.reboot_required
+
+    # --------------------------------------------------------------------------
+    # Set Timezone
+    # --------------------------------------------------------------------------
+    - name: Set timezone to UTC
+      ansible.windows.win_timezone:
+        timezone: "{{ windows_timezone }}"
+
+    # --------------------------------------------------------------------------
+    # Install Windows Features
+    # --------------------------------------------------------------------------
+    - name: Install AD DS and DNS features
+      ansible.windows.win_feature:
+        name: "{{ windows_features }}"
+        state: present
+        include_management_tools: true
+      register: feature_install
+
+    - name: Reboot if required after feature installation
+      ansible.windows.win_reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        post_reboot_delay: "{{ post_reboot_delay }}"
+      when: feature_install.reboot_required
+
+    # --------------------------------------------------------------------------
+    # Configure Windows Firewall
+    # --------------------------------------------------------------------------
+    - name: Enable Windows Firewall AD DS rules
+      ansible.windows.win_shell: |
+        Get-NetFirewallRule -DisplayGroup "Active Directory Domain Services" -ErrorAction SilentlyContinue | Enable-NetFirewallRule
+        Get-NetFirewallRule -DisplayGroup "DNS Service" -ErrorAction SilentlyContinue | Enable-NetFirewallRule
+        Get-NetFirewallRule -DisplayGroup "File and Printer Sharing" -ErrorAction SilentlyContinue | Enable-NetFirewallRule
+        Write-Output "Built-in firewall rules enabled"
+
+    - name: Create AD Kerberos TCP firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-Kerberos-TCP
+        localport: 88
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD Kerberos UDP firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-Kerberos-UDP
+        localport: 88
+        protocol: udp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD LDAP TCP firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-LDAP-TCP
+        localport: 389
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD LDAP UDP firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-LDAP-UDP
+        localport: 389
+        protocol: udp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD LDAPS firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-LDAPS
+        localport: 636
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD Global Catalog firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-GC
+        localport: 3268
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD Global Catalog SSL firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-GC-SSL
+        localport: 3269
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD DNS TCP firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-DNS-TCP
+        localport: 53
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD DNS UDP firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-DNS-UDP
+        localport: 53
+        protocol: udp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD SMB firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-SMB
+        localport: 445
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD RPC firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-RPC
+        localport: 135
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD Kpasswd TCP firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-Kpasswd-TCP
+        localport: 464
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    - name: Create AD Kpasswd UDP firewall rule
+      community.windows.win_firewall_rule:
+        name: AD-Kpasswd-UDP
+        localport: 464
+        protocol: udp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    # --------------------------------------------------------------------------
+    # Configure DNS Client
+    # --------------------------------------------------------------------------
+    - name: Get network adapter name
+      ansible.windows.win_shell: |
+        (Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Name -notlike '*Loopback*' } | Select-Object -First 1).Name
+      register: adapter_name
+
+    - name: Display adapter name
+      ansible.builtin.debug:
+        msg: "Primary network adapter: {{ adapter_name.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Verify Preparation
+    # --------------------------------------------------------------------------
+    - name: Verify AD DS feature is installed
+      ansible.windows.win_shell: |
+        $feature = Get-WindowsFeature -Name AD-Domain-Services
+        if ($feature.Installed) {
+          Write-Output "AD-Domain-Services: Installed"
+        } else {
+          Write-Output "AD-Domain-Services: NOT Installed"
+          exit 1
+        }
+      register: verify_adds
+      failed_when: "'NOT Installed' in verify_adds.stdout"
+
+    - name: Preparation complete
+      ansible.builtin.debug:
+        msg: |
+          Server {{ dc_hostname }} is prepared for AD DS promotion.
+          - Hostname: {{ dc_hostname }}
+          - Role: {{ dc_role }}
+          - Site: {{ ad_site_name }}
+          - AD DS Features: Installed

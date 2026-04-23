@@ -1,0 +1,240 @@
+# ==============================================================================
+# PLAYBOOK: 04-configure-sites-ssm.yml
+# Configures AD Sites and subnets for multi-region replication
+#
+# Run: ansible-playbook playbooks/04-configure-sites-ssm.yml
+# ==============================================================================
+---
+- name: Configure AD Sites and Subnets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+    site_link:
+      name: "US-East-2-to-AP-Southeast-1"
+      cost: 100
+      replication_interval: 15
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Verify AD DS Running on DC01
+    # --------------------------------------------------------------------------
+    - name: Verify AD DS is operational
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["Get-ADDomain | Select-Object -Property DNSRoot | ConvertTo-Json"]}'
+          --output json
+      register: verify_cmd
+
+    - name: Wait for verification
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (verify_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: verify_result
+      until: verify_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display AD status
+      ansible.builtin.debug:
+        msg: "AD Domain: {{ verify_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Create AD Sites
+    # --------------------------------------------------------------------------
+    - name: Create AD Sites
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["$sites = @(\"US-East-2\", \"AP-Southeast-1\"); foreach ($site in $sites) { try { Get-ADReplicationSite -Identity $site -ErrorAction Stop; Write-Output \"Site $site already exists\" } catch { New-ADReplicationSite -Name $site; Write-Output \"Created site $site\" } }"]}'
+          --output json
+      register: sites_cmd
+
+    - name: Wait for sites creation
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (sites_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: sites_result
+      until: sites_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display sites result
+      ansible.builtin.debug:
+        msg: "{{ sites_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Create AD Subnets
+    # --------------------------------------------------------------------------
+    - name: Create AD Subnets
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["try { Get-ADReplicationSubnet -Identity \"10.0.0.0/16\" -ErrorAction Stop; Write-Output \"Subnet 10.0.0.0/16 exists\" } catch { New-ADReplicationSubnet -Name \"10.0.0.0/16\" -Site \"US-East-2\"; Write-Output \"Created subnet 10.0.0.0/16 in US-East-2\" }; try { Get-ADReplicationSubnet -Identity \"10.2.0.0/16\" -ErrorAction Stop; Write-Output \"Subnet 10.2.0.0/16 exists\" } catch { New-ADReplicationSubnet -Name \"10.2.0.0/16\" -Site \"AP-Southeast-1\"; Write-Output \"Created subnet 10.2.0.0/16 in AP-Southeast-1\" }"]}'
+          --output json
+      register: subnets_cmd
+
+    - name: Wait for subnets creation
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (subnets_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: subnets_result
+      until: subnets_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display subnets result
+      ansible.builtin.debug:
+        msg: "{{ subnets_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Create Site Link
+    # --------------------------------------------------------------------------
+    - name: Create Site Link
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["$linkName = \"US-East-2-to-AP-Southeast-1\"; try { Get-ADReplicationSiteLink -Identity $linkName -ErrorAction Stop; Write-Output \"Site link $linkName exists\" } catch { New-ADReplicationSiteLink -Name $linkName -SitesIncluded @(\"US-East-2\",\"AP-Southeast-1\") -Cost 100 -ReplicationFrequencyInMinutes 15 -InterSiteTransportProtocol IP; Write-Output \"Created site link $linkName\" }"]}'
+          --output json
+      register: link_cmd
+
+    - name: Wait for site link creation
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (link_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: link_result
+      until: link_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display site link result
+      ansible.builtin.debug:
+        msg: "{{ link_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Move DCs to Correct Sites
+    # --------------------------------------------------------------------------
+    - name: Move DC01 and DC02 to US-East-2 site
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["Move-ADDirectoryServer -Identity \"DC01\" -Site \"US-East-2\" -ErrorAction SilentlyContinue; Move-ADDirectoryServer -Identity \"DC02\" -Site \"US-East-2\" -ErrorAction SilentlyContinue; Write-Output \"DCs moved to US-East-2 site\""]}'
+          --output json
+      register: move_cmd
+
+    - name: Wait for DC move
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (move_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: move_result
+      until: move_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display move result
+      ansible.builtin.debug:
+        msg: "{{ move_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Display Configuration Summary
+    # --------------------------------------------------------------------------
+    - name: Get sites configuration summary
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["Write-Output \"=== AD Sites ===\"; Get-ADReplicationSite -Filter * | Format-Table Name -AutoSize; Write-Output \"`n=== AD Subnets ===\"; Get-ADReplicationSubnet -Filter * | Format-Table Name,Site -AutoSize; Write-Output \"`n=== Site Links ===\"; Get-ADReplicationSiteLink -Filter * | Format-Table Name,Cost,ReplicationFrequencyInMinutes -AutoSize; Write-Output \"`n=== Domain Controllers ===\"; Get-ADDomainController -Filter * | Format-Table Name,Site,IPv4Address -AutoSize"]}'
+          --output json
+      register: summary_cmd
+
+    - name: Wait for summary
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (summary_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: summary_result
+      until: summary_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display configuration summary
+      ansible.builtin.debug:
+        msg: "{{ summary_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Complete
+    # --------------------------------------------------------------------------
+    - name: Sites configuration complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          AD SITES CONFIGURATION COMPLETE
+          ============================================
+          
+          Sites Created:
+            - US-East-2 (10.0.0.0/16)
+            - AP-Southeast-1 (10.2.0.0/16)
+          
+          Site Link:
+            - US-East-2-to-AP-Southeast-1
+            - Cost: 100
+            - Replication: 15 minutes
+          
+          DC01 and DC02 are in US-East-2 site.
+          
+          Next steps:
+            1. Deploy ap-southeast-1 firewall updates
+            2. Run 05-promote-dc03-ssm.yml
+          ============================================

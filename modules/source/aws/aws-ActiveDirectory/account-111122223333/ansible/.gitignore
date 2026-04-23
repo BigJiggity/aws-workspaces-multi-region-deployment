@@ -1,0 +1,24 @@
+# Ansible cache and temporary files
+.ansible_cache/
+*.retry
+ansible.log
+
+# Inventory backups
+*.bak
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Vault password files
+.vault_pass*
+vault_password*
+
+# Secrets files (NEVER commit these)
+secrets.yml
+**/secrets.yml
+vars/secrets.yml
+
+# Local overrides
+*.local.yml
+local_*.yml

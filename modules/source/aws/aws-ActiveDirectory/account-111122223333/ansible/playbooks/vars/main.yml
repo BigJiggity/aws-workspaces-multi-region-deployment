@@ -1,0 +1,94 @@
+# ==============================================================================
+# CENTRAL VARIABLES FILE
+# All playbooks should reference this file for consistency
+#
+# Usage in playbooks:
+#   vars_files:
+#     - vars/main.yml
+#
+# UPDATED: December 2025 - All DCs rebuilt after infrastructure replacement
+# ==============================================================================
+---
+# ------------------------------------------------------------------------------
+# DOMAIN CONTROLLER INVENTORY
+# ------------------------------------------------------------------------------
+dc01:
+  instance_id: "i-0d74f088f44fc088b"
+  hostname: "DC01"
+  region: "us-east-2"
+  private_ip: "10.0.12.10"
+  site: "US-East-2"
+
+dc02:
+  instance_id: "i-057c205efd2d28087"
+  hostname: "DC02"
+  region: "us-east-1"
+  private_ip: "10.1.12.10"
+  site: "US-East-1"
+
+dc03:
+  instance_id: "i-0f2607ac2de5b1f24"
+  hostname: "DC03"
+  region: "ap-southeast-1"
+  private_ip: "10.2.10.10"
+  site: "AP-Southeast-1"
+
+# All DCs for iteration
+all_dcs:
+  - instance_id: "i-0d74f088f44fc088b"
+    hostname: "DC01"
+    region: "us-east-2"
+    private_ip: "10.0.12.10"
+    site: "US-East-2"
+  - instance_id: "i-057c205efd2d28087"
+    hostname: "DC02"
+    region: "us-east-1"
+    private_ip: "10.1.12.10"
+    site: "US-East-1"
+  - instance_id: "i-0f2607ac2de5b1f24"
+    hostname: "DC03"
+    region: "ap-southeast-1"
+    private_ip: "10.2.10.10"
+    site: "AP-Southeast-1"
+
+# ------------------------------------------------------------------------------
+# ACTIVE DIRECTORY CONFIGURATION
+# ------------------------------------------------------------------------------
+ad_domain_name: "example.internal"
+ad_netbios_name: "ORG"
+ad_forest_mode: "WinThreshold"
+ad_domain_mode: "WinThreshold"
+
+# ------------------------------------------------------------------------------
+# PASSWORDS
+# Credentials are stored in AWS Secrets Manager: org-infrastructure/credentials
+#
+# To load credentials in playbooks, add this at the start of tasks:
+#   - name: Load secrets from AWS Secrets Manager
+#     include_tasks: load-secrets.yml
+#
+# This will set these variables:
+#   - ad_admin_password (also aliased as ad_password)
+#   - ad_safe_mode_password
+#   - svc_workspaces_password (also aliased as svc_password)
+#   - svc_adconnector_password
+#
+# To update passwords:
+#   aws secretsmanager update-secret --region us-east-2 \
+#     --secret-id org-infrastructure/credentials \
+#     --secret-string '{"ad_admin_password": "NEW_PASS", ...}'
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# AD SITES
+# ------------------------------------------------------------------------------
+ad_sites:
+  - name: "US-East-2"
+    subnets:
+      - "10.0.0.0/16"
+  - name: "US-East-1"
+    subnets:
+      - "10.1.0.0/16"
+  - name: "AP-Southeast-1"
+    subnets:
+      - "10.2.0.0/16"

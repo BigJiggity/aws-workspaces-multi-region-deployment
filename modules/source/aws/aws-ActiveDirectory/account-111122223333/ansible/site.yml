@@ -1,0 +1,98 @@
+# ==============================================================================
+# PLAYBOOK: site.yml
+# Master playbook to configure all domain controllers
+#
+# This playbook runs all configuration steps in order.
+# For individual steps, run the numbered playbooks directly.
+#
+# Prerequisites:
+#   1. Deploy infrastructure: cd ../; terraform apply
+#   2. Update inventory/hosts.yml with instance IDs from terraform output
+#   3. Set environment variables:
+#        export AD_SAFE_MODE_PASSWORD="YourDSRMPassword123"
+#        export AD_ADMIN_PASSWORD="YourAdminPassword123"
+#        export AD_CONNECTOR_PASSWORD="YourConnectorPassword123"
+#
+# Run: ansible-playbook site.yml
+# ==============================================================================
+---
+# Step 1: Prepare all servers
+- name: Import prepare-servers playbook
+  ansible.builtin.import_playbook: playbooks/01-prepare-servers.yml
+
+# Step 2: Promote DC01 as primary DC
+- name: Import promote-dc01 playbook
+  ansible.builtin.import_playbook: playbooks/02-promote-dc01.yml
+
+# Step 3: Promote DC02 as secondary DC
+- name: Import promote-dc02 playbook
+  ansible.builtin.import_playbook: playbooks/03-promote-dc02.yml
+
+# Step 4: Configure AD Sites
+- name: Import configure-sites playbook
+  ansible.builtin.import_playbook: playbooks/04-configure-sites.yml
+
+# Step 5: Promote DC03 as replica DC
+- name: Import promote-dc03 playbook
+  ansible.builtin.import_playbook: playbooks/05-promote-dc03.yml
+
+# Step 6: Create service accounts
+- name: Import create-service-accounts playbook
+  ansible.builtin.import_playbook: playbooks/06-create-service-accounts.yml
+
+# Final verification
+- name: Final Verification
+  hosts: dc01
+  gather_facts: false
+  
+  tasks:
+    - name: Get all domain controllers
+      ansible.windows.win_shell: |
+        Get-ADDomainController -Filter * | 
+          Select-Object Name, Site, IPv4Address, IsGlobalCatalog, OperatingSystem |
+          Format-Table -AutoSize | Out-String
+      register: all_dcs
+
+    - name: Display all domain controllers
+      ansible.builtin.debug:
+        var: all_dcs.stdout
+
+    - name: Check replication health
+      ansible.windows.win_shell: |
+        repadmin /replsummary
+      register: repl_health
+
+    - name: Display replication health
+      ansible.builtin.debug:
+        var: repl_health.stdout_lines
+
+    - name: Configuration complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          EXAMPLE.INTERNAL ACTIVE DIRECTORY CONFIGURATION COMPLETE
+          ============================================================
+          
+          Domain Controllers:
+            - DC01 (us-east-2a) - Primary Domain Controller
+            - DC02 (us-east-2b) - Secondary Domain Controller
+            - DC03 (ap-southeast-1a) - Replica Domain Controller
+          
+          AD Sites:
+            - US-East-2 (10.0.0.0/16)
+            - AP-Southeast-1 (10.2.0.0/16)
+          
+          Service Accounts:
+            - svc_adconnector (for AD Connector)
+            - svc_workspaces (for WorkSpaces)
+            - testuser (for testing)
+          
+          Next Steps:
+            1. Deploy TGW peering and AD Connector:
+               cd ~/Repos/cloud_infrastructure/org-workspaces-vdi
+               export TF_VAR_ad_connector_password="<your_password>"
+               terraform apply
+            
+            2. Provision WorkSpaces for testuser
+          
+          ============================================================

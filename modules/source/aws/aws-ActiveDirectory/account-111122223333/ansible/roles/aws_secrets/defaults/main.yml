@@ -1,0 +1,7 @@
+# ==============================================================================
+# ROLE DEFAULTS: aws_secrets
+# ==============================================================================
+---
+# AWS Secrets Manager configuration
+secrets_name: "org-infrastructure/credentials"
+secrets_region: "us-east-2"

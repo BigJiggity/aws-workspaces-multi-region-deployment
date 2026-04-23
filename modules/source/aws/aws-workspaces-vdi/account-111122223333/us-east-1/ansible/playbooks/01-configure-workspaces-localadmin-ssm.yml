@@ -1,0 +1,263 @@
+# ==============================================================================
+# PLAYBOOK: 01-configure-workspaces-localadmin-ssm.yml
+# Creates AD group and GPO to grant local admin rights on WorkSpaces
+#
+# This playbook:
+#   1. Creates "WorkSpaces Computers" OU (if not exists)
+#   2. Creates "WorkSpaces-LocalAdmins" AD security group
+#   3. Creates a GPO with Restricted Groups policy
+#   4. Links GPO to the WorkSpaces Computers OU
+#
+# Prerequisites:
+#   - Domain Controllers deployed and operational
+#   - AWS CLI configured with appropriate permissions
+#
+# Run: ansible-playbook playbooks/01-configure-workspaces-localadmin-ssm.yml -v
+# ==============================================================================
+---
+- name: Configure WorkSpaces Local Admin via Group Policy
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Step 1: Create WorkSpaces Computers OU
+    # --------------------------------------------------------------------------
+    - name: Create WorkSpaces Computers OU
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["try { Get-ADOrganizationalUnit -Identity \"OU=WorkSpaces Computers,DC=example,DC=internal\" -ErrorAction Stop; Write-Output \"OU already exists\" } catch { New-ADOrganizationalUnit -Name \"WorkSpaces Computers\" -Path \"DC=example,DC=internal\" -Description \"Computer accounts for AWS WorkSpaces\"; Write-Output \"Created OU: WorkSpaces Computers\" }"]'
+          --output json
+      register: ou_cmd
+
+    - name: Wait for OU creation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (ou_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: ou_result
+      until: ou_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display OU result
+      ansible.builtin.debug:
+        msg: "{{ ou_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Step 2: Create WorkSpaces-LocalAdmins Security Group
+    # --------------------------------------------------------------------------
+    - name: Create WorkSpaces-LocalAdmins security group
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["try { Get-ADGroup -Identity \"{{ workspaces_local_admin_group }}\" -ErrorAction Stop; Write-Output \"Group already exists\" } catch { New-ADGroup -Name \"{{ workspaces_local_admin_group }}\" -GroupScope Global -GroupCategory Security -Path \"CN=Users,DC=example,DC=internal\" -Description \"Members get local admin rights on WorkSpaces\"; Write-Output \"Created group: {{ workspaces_local_admin_group }}\" }"]'
+          --output json
+      register: group_cmd
+
+    - name: Wait for group creation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (group_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: group_result
+      until: group_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display group result
+      ansible.builtin.debug:
+        msg: "{{ group_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Step 3: Create and Link GPO
+    # --------------------------------------------------------------------------
+    - name: Create GPO and link to OU
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 120
+          --parameters commands='["Import-Module GroupPolicy; $gpoName = \"{{ workspaces_local_admin_gpo }}\"; $ou = \"{{ workspaces_computers_ou }}\"; try { $gpo = Get-GPO -Name $gpoName -ErrorAction Stop; Write-Output \"GPO already exists: $gpoName\" } catch { $gpo = New-GPO -Name $gpoName -Comment \"Adds WorkSpaces-LocalAdmins to local Administrators\"; Write-Output \"Created GPO: $gpoName\" }; try { New-GPLink -Guid $gpo.Id -Target $ou -LinkEnabled Yes -ErrorAction Stop; Write-Output \"Linked GPO to: $ou\" } catch { if ($_.Exception.Message -like \"*already linked*\") { Write-Output \"GPO already linked to: $ou\" } else { throw $_ } }; Write-Output \"GPO ID: $($gpo.Id)\""]'
+          --output json
+      register: gpo_cmd
+
+    - name: Wait for GPO creation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (gpo_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: gpo_result
+      until: "(gpo_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 8
+
+    - name: Display GPO result
+      ansible.builtin.debug:
+        msg: "{{ (gpo_result.stdout | from_json)[1] }}"
+
+    - name: Extract GPO ID
+      ansible.builtin.set_fact:
+        gpo_id: "{{ (gpo_result.stdout | from_json)[1] | regex_search('GPO ID: ([a-f0-9-]+)', '\\1') | first }}"
+
+    - name: Display GPO ID
+      ansible.builtin.debug:
+        msg: "GPO ID: {{ gpo_id }}"
+
+    # --------------------------------------------------------------------------
+    # Step 4: Configure Restricted Groups Policy
+    # --------------------------------------------------------------------------
+    - name: Configure Restricted Groups policy
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 120
+          --parameters commands='["$groupSid = (Get-ADGroup -Identity \"{{ workspaces_local_admin_group }}\").SID.Value; $gpoId = \"{{ gpo_id }}\"; $policyPath = \"\\\\example.internal\\SYSVOL\\example.internal\\Policies\\{$gpoId}\\Machine\\Microsoft\\Windows NT\\SecEdit\"; New-Item -Path $policyPath -ItemType Directory -Force | Out-Null; $infLines = @(\"[Unicode]\", \"Unicode=yes\", \"[Version]\", \"signature=`\"`$CHICAGO`$`\"\", \"Revision=1\", \"[Group Membership]\", \"*S-1-5-32-544__Memberof =\", \"*S-1-5-32-544__Members = *$groupSid\"); $infContent = $infLines -join \"`r`n\"; [System.IO.File]::WriteAllText(\"$policyPath\\GptTmpl.inf\", $infContent, [System.Text.Encoding]::Unicode); Write-Output \"Created GptTmpl.inf\"; Write-Output \"Group SID: $groupSid\"; Write-Output \"Policy Path: $policyPath\""]'
+          --output json
+      register: policy_cmd
+
+    - name: Wait for policy configuration
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (policy_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: policy_result
+      until: "(policy_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 15
+      delay: 8
+
+    - name: Display policy result
+      ansible.builtin.debug:
+        msg: "{{ (policy_result.stdout | from_json)[1] }}"
+
+    # --------------------------------------------------------------------------
+    # Step 5: Update GPO Version
+    # --------------------------------------------------------------------------
+    - name: Update GPO version to trigger refresh
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["$gpoId = \"{{ gpo_id }}\"; $gptIniPath = \"\\\\example.internal\\SYSVOL\\example.internal\\Policies\\{$gpoId}\\GPT.INI\"; $content = Get-Content $gptIniPath -Raw; if ($content -match \"Version=(\\d+)\") { $oldVer = [int]$matches[1]; $newVer = $oldVer + 1; $content = $content -replace \"Version=$oldVer\", \"Version=$newVer\"; $content | Set-Content $gptIniPath -Force; Write-Output \"Updated GPO version: $oldVer -> $newVer\" } else { Write-Output \"Version not found, GPO may need manual refresh\" }"]'
+          --output json
+      register: version_cmd
+
+    - name: Wait for version update
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (version_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: version_result
+      until: version_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display version result
+      ansible.builtin.debug:
+        msg: "{{ version_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Step 6: Force Replication
+    # --------------------------------------------------------------------------
+    - name: Force AD replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["repadmin /syncall /A /e /P | Out-Null; Write-Output \"Replication initiated to all DCs\""]'
+          --output json
+      register: repl_cmd
+
+    - name: Wait for replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (repl_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: repl_result
+      until: repl_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display replication result
+      ansible.builtin.debug:
+        msg: "{{ repl_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------------------------
+    - name: Configuration complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          WORKSPACES LOCAL ADMIN CONFIGURED
+          ============================================
+          
+          Components Created:
+            - OU: {{ workspaces_computers_ou }}
+            - Group: {{ workspaces_local_admin_group }}
+            - GPO: {{ workspaces_local_admin_gpo }}
+            - GPO ID: {{ gpo_id }}
+          
+          How it works:
+            1. Add users to "{{ workspaces_local_admin_group }}" group
+            2. WorkSpace computer is placed in the OU (via Terraform default_ou)
+            3. GPO applies, adding the AD group to local Administrators
+            4. User has local admin rights on their WorkSpace
+          
+          To add a user to local admins:
+            ansible-playbook playbooks/02-add-user-to-localadmins-ssm.yml -e "username=USERNAME"
+          
+          Or via PowerShell on DC01:
+            Add-ADGroupMember -Identity "{{ workspaces_local_admin_group }}" -Members "username"
+          
+          For existing WorkSpaces, run on the WorkSpace:
+            gpupdate /force
+          
+          ============================================

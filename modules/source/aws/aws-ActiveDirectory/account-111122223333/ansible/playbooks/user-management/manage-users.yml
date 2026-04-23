@@ -1,0 +1,373 @@
+# ==============================================================================
+# PLAYBOOK: manage-users.yml
+# Creates, updates, disables, or deletes AD users via SSM
+#
+# Usage:
+#   ansible-playbook user-management/manage-users.yml
+#   ansible-playbook user-management/manage-users.yml -e "user_action=delete"
+# ==============================================================================
+---
+- name: Manage Active Directory Users
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - ../vars/main.yml
+    - users.yml
+
+  vars:
+    ansible_shell_type: sh
+    ad_domain: "{{ ad_domain_name }}"
+    ad_netbios: "{{ ad_netbios_name }}"
+    default_ou: "CN=Users,DC=example,DC=internal"
+    user_action: "create"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Verify SSM Connectivity
+    # --------------------------------------------------------------------------
+    - name: Check SSM agent status for DC01
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc01.region }}
+          --filters "Key=InstanceIds,Values={{ dc01.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: ssm_status
+      changed_when: false
+
+    - name: Fail if DC01 not online
+      ansible.builtin.fail:
+        msg: "DC01 SSM agent is not online. Status: {{ ssm_status.stdout }}"
+      when: ssm_status.stdout != "Online"
+
+    # --------------------------------------------------------------------------
+    # CREATE USERS
+    # --------------------------------------------------------------------------
+    - name: Create temp script for user creation
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          aws ssm send-command \
+            --region {{ dc01.region }} \
+            --instance-ids {{ dc01.instance_id }} \
+            --document-name "AWS-RunPowerShellScript" \
+            --parameters 'commands=["$u=\"{{ item.username }}\"; $d=\"{{ item.display_name }}\"; $p=ConvertTo-SecureString \"{{ item.password }}\" -AsPlainText -Force; $e=\"{{ item.email | default(item.username + '@' + ad_domain) }}\"; try { $x=Get-ADUser -Identity $u -EA SilentlyContinue; if($x){Write-Output \"EXISTS: $u\"}else{New-ADUser -Name $d -SamAccountName $u -UserPrincipalName \"$u@{{ ad_domain }}\" -AccountPassword $p -Enabled $true -Path \"{{ item.ou | default(default_ou) }}\" -EmailAddress $e; Write-Output \"CREATED: $u\"} } catch { Write-Output \"ERROR: $($_.Exception.Message)\"; exit 1 }"]' \
+            --output json
+        dest: "/tmp/create_user_{{ item.username }}.sh"
+        mode: '0755'
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: user_action == "create"
+
+    - name: Execute user creation scripts
+      ansible.builtin.command:
+        cmd: "/tmp/create_user_{{ item.username }}.sh"
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      register: create_commands
+      when: user_action == "create"
+
+    - name: Wait for create commands
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (item.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      loop: "{{ create_commands.results }}"
+      loop_control:
+        label: "{{ item.item.username }}"
+      register: create_results
+      until: "(create_results.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 10
+      delay: 5
+      when: user_action == "create" and item.stdout is defined
+
+    - name: Display create results
+      ansible.builtin.debug:
+        msg: "{{ item.item.item.username }}: {{ (item.stdout | from_json)[1] | default('') | trim }}"
+      loop: "{{ create_results.results }}"
+      loop_control:
+        label: "{{ item.item.item.username }}"
+      when: user_action == "create" and item.stdout is defined
+
+    - name: Cleanup create scripts
+      ansible.builtin.file:
+        path: "/tmp/create_user_{{ item.username }}.sh"
+        state: absent
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: user_action == "create"
+
+    # --------------------------------------------------------------------------
+    # ADD USERS TO GROUPS
+    # --------------------------------------------------------------------------
+    - name: Create temp script for group membership
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          aws ssm send-command \
+            --region {{ dc01.region }} \
+            --instance-ids {{ dc01.instance_id }} \
+            --document-name "AWS-RunPowerShellScript" \
+            --parameters 'commands=["try { Add-ADGroupMember -Identity \"{{ item.1 }}\" -Members \"{{ item.0.username }}\" -EA Stop; Write-Output \"ADDED: {{ item.0.username }} to {{ item.1 }}\" } catch { if($_.Exception.Message -like \"*already*\"){Write-Output \"ALREADY_MEMBER\"}else{Write-Output \"ERROR: $($_.Exception.Message)\"} }"]' \
+            --output json
+        dest: "/tmp/add_group_{{ item.0.username }}_{{ item.1 | regex_replace('[^a-zA-Z0-9]', '_') }}.sh"
+        mode: '0755'
+      loop: "{{ ad_users | subelements('groups', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.username }} -> {{ item.1 }}"
+      when: user_action == "create"
+
+    - name: Execute group membership scripts
+      ansible.builtin.command:
+        cmd: "/tmp/add_group_{{ item.0.username }}_{{ item.1 | regex_replace('[^a-zA-Z0-9]', '_') }}.sh"
+      loop: "{{ ad_users | subelements('groups', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.username }} -> {{ item.1 }}"
+      register: group_commands
+      when: user_action == "create"
+
+    - name: Wait for group commands
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (item.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      loop: "{{ group_commands.results }}"
+      loop_control:
+        label: "{{ item.item.0.username }} -> {{ item.item.1 }}"
+      register: group_results
+      until: group_results is succeeded
+      retries: 10
+      delay: 3
+      when: user_action == "create" and item.stdout is defined
+
+    - name: Display group results
+      ansible.builtin.debug:
+        msg: "{{ item.item.item.0.username }} -> {{ item.item.item.1 }}: {{ item.stdout | default('') | trim }}"
+      loop: "{{ group_results.results }}"
+      loop_control:
+        label: "{{ item.item.item.0.username | default('unknown') }}"
+      when: user_action == "create" and item.stdout is defined
+
+    # --------------------------------------------------------------------------
+    # DELETE USERS
+    # --------------------------------------------------------------------------
+    - name: Create temp script for user deletion
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          aws ssm send-command \
+            --region {{ dc01.region }} \
+            --instance-ids {{ dc01.instance_id }} \
+            --document-name "AWS-RunPowerShellScript" \
+            --parameters 'commands=["try { Remove-ADUser -Identity \"{{ item.username }}\" -Confirm:$false; Write-Output \"DELETED: {{ item.username }}\" } catch { Write-Output \"ERROR: $($_.Exception.Message)\" }"]' \
+            --output json
+        dest: "/tmp/delete_user_{{ item.username }}.sh"
+        mode: '0755'
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: user_action == "delete"
+
+    - name: Execute user deletion scripts
+      ansible.builtin.command:
+        cmd: "/tmp/delete_user_{{ item.username }}.sh"
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      register: delete_commands
+      when: user_action == "delete"
+
+    - name: Wait for delete commands
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (item.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      loop: "{{ delete_commands.results }}"
+      loop_control:
+        label: "{{ item.item.username }}"
+      register: delete_results
+      until: delete_results is succeeded
+      retries: 10
+      delay: 3
+      when: user_action == "delete" and item.stdout is defined
+
+    - name: Display delete results
+      ansible.builtin.debug:
+        msg: "{{ item.stdout | trim }}"
+      loop: "{{ delete_results.results }}"
+      loop_control:
+        label: "{{ item.item.item.username }}"
+      when: user_action == "delete" and item.stdout is defined
+
+    # --------------------------------------------------------------------------
+    # DISABLE USERS
+    # --------------------------------------------------------------------------
+    - name: Create temp script for user disable
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          aws ssm send-command \
+            --region {{ dc01.region }} \
+            --instance-ids {{ dc01.instance_id }} \
+            --document-name "AWS-RunPowerShellScript" \
+            --parameters 'commands=["Disable-ADAccount -Identity \"{{ item.username }}\"; Write-Output \"DISABLED: {{ item.username }}\""]' \
+            --output json
+        dest: "/tmp/disable_user_{{ item.username }}.sh"
+        mode: '0755'
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: user_action == "disable"
+
+    - name: Execute user disable scripts
+      ansible.builtin.command:
+        cmd: "/tmp/disable_user_{{ item.username }}.sh"
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      register: disable_commands
+      when: user_action == "disable"
+
+    - name: Wait for disable commands
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (item.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      loop: "{{ disable_commands.results }}"
+      loop_control:
+        label: "{{ item.item.username }}"
+      register: disable_results
+      until: disable_results is succeeded
+      retries: 10
+      delay: 3
+      when: user_action == "disable" and item.stdout is defined
+
+    # --------------------------------------------------------------------------
+    # ENABLE USERS
+    # --------------------------------------------------------------------------
+    - name: Create temp script for user enable
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          aws ssm send-command \
+            --region {{ dc01.region }} \
+            --instance-ids {{ dc01.instance_id }} \
+            --document-name "AWS-RunPowerShellScript" \
+            --parameters 'commands=["Enable-ADAccount -Identity \"{{ item.username }}\"; Write-Output \"ENABLED: {{ item.username }}\""]' \
+            --output json
+        dest: "/tmp/enable_user_{{ item.username }}.sh"
+        mode: '0755'
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: user_action == "enable"
+
+    - name: Execute user enable scripts
+      ansible.builtin.command:
+        cmd: "/tmp/enable_user_{{ item.username }}.sh"
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      register: enable_commands
+      when: user_action == "enable"
+
+    - name: Wait for enable commands
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (item.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      loop: "{{ enable_commands.results }}"
+      loop_control:
+        label: "{{ item.item.username }}"
+      register: enable_results
+      until: enable_results is succeeded
+      retries: 10
+      delay: 3
+      when: user_action == "enable" and item.stdout is defined
+
+    # --------------------------------------------------------------------------
+    # RESET PASSWORDS
+    # --------------------------------------------------------------------------
+    - name: Create temp script for password reset
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          aws ssm send-command \
+            --region {{ dc01.region }} \
+            --instance-ids {{ dc01.instance_id }} \
+            --document-name "AWS-RunPowerShellScript" \
+            --parameters 'commands=["$p=ConvertTo-SecureString \"{{ item.password }}\" -AsPlainText -Force; Set-ADAccountPassword -Identity \"{{ item.username }}\" -NewPassword $p -Reset; Write-Output \"PASSWORD_RESET: {{ item.username }}\""]' \
+            --output json
+        dest: "/tmp/reset_pwd_{{ item.username }}.sh"
+        mode: '0755'
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: user_action == "reset_password"
+
+    - name: Execute password reset scripts
+      ansible.builtin.command:
+        cmd: "/tmp/reset_pwd_{{ item.username }}.sh"
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      register: reset_commands
+      when: user_action == "reset_password"
+
+    - name: Wait for reset commands
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (item.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      loop: "{{ reset_commands.results }}"
+      loop_control:
+        label: "{{ item.item.username }}"
+      register: reset_results
+      until: reset_results is succeeded
+      retries: 10
+      delay: 3
+      when: user_action == "reset_password" and item.stdout is defined
+
+    # --------------------------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------------------------
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          AD User Management Complete
+          ============================================
+          Action: {{ user_action }}
+          Users processed: {{ ad_users | length }}
+          Domain: {{ ad_domain }}
+          ============================================

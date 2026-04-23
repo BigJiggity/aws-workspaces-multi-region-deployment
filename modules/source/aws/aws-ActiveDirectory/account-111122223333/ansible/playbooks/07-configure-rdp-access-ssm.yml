@@ -1,0 +1,248 @@
+# ==============================================================================
+# PLAYBOOK: 07-configure-rdp-access-ssm.yml
+# Resets Administrator password and ensures RDP access on all DCs
+#
+# Run: ansible-playbook playbooks/07-configure-rdp-access-ssm.yml
+# ==============================================================================
+---
+- name: Configure RDP Access on All Domain Controllers
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Reset Administrator Password on DC01 (Primary)
+    # This will replicate to DC02 and DC03
+    # --------------------------------------------------------------------------
+    - name: Reset Administrator password on DC01
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Set-ADAccountPassword -Identity Administrator -NewPassword (ConvertTo-SecureString \"{{ ad_password }}\" -AsPlainText -Force) -Reset; Set-ADUser -Identity Administrator -PasswordNeverExpires $true; Write-Output \"Administrator password reset successfully\""]'
+          --output json
+      register: pwd_cmd
+
+    - name: Wait for password reset
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (pwd_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: pwd_result
+      until: "(pwd_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 10
+      delay: 5
+
+    - name: Display password reset result
+      ansible.builtin.debug:
+        msg: "DC01: {{ (pwd_result.stdout | from_json)[1] | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Add Administrator to Remote Desktop Users Group
+    # --------------------------------------------------------------------------
+    - name: Add Administrator to Remote Desktop Users group
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Add-ADGroupMember -Identity \"Remote Desktop Users\" -Members Administrator -ErrorAction SilentlyContinue; Write-Output \"Administrator added to Remote Desktop Users group\""]'
+          --output json
+      register: rdp_group_cmd
+
+    - name: Wait for group membership
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (rdp_group_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: rdp_group_result
+      until: rdp_group_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display group result
+      ansible.builtin.debug:
+        msg: "{{ rdp_group_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Force Replication to All DCs
+    # --------------------------------------------------------------------------
+    - name: Force AD replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["repadmin /syncall /A /e /P; Write-Output \"Replication initiated to all DCs\""]'
+          --output json
+      register: repl_cmd
+
+    - name: Wait for replication command
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (repl_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: repl_result
+      until: repl_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Wait for replication to complete
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting 30 seconds for cross-region replication..."
+
+    # --------------------------------------------------------------------------
+    # Enable RDP on All DCs
+    # --------------------------------------------------------------------------
+    - name: Enable RDP on US-East-2 DCs
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ item.region }}
+          --instance-ids {{ item.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Set-ItemProperty -Path \"HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server\" -Name \"fDenyTSConnections\" -Value 0; Enable-NetFirewallRule -DisplayGroup \"Remote Desktop\" -ErrorAction SilentlyContinue; Write-Output \"RDP enabled on {{ item.hostname }}\""]'
+          --output json
+      loop: "{{ us_east_2_dcs }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+      register: rdp_use2_cmds
+
+    - name: Wait for RDP enable on US-East-2
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ item.item.region }}
+          --command-id {{ (item.stdout | from_json).Command.CommandId }}
+          --instance-id {{ item.item.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      loop: "{{ rdp_use2_cmds.results }}"
+      loop_control:
+        label: "{{ item.item.hostname }}"
+      register: rdp_use2_results
+      until: rdp_use2_results is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display RDP results for US-East-2
+      ansible.builtin.debug:
+        msg: "{{ item.stdout | trim }}"
+      loop: "{{ rdp_use2_results.results }}"
+      loop_control:
+        label: "{{ item.item.item.hostname }}"
+
+    - name: Enable RDP on DC03 (AP-Southeast-1)
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Set-ItemProperty -Path \"HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server\" -Name \"fDenyTSConnections\" -Value 0; Enable-NetFirewallRule -DisplayGroup \"Remote Desktop\" -ErrorAction SilentlyContinue; Write-Output \"RDP enabled on DC03\""]'
+          --output json
+      register: rdp_dc03_cmd
+
+    - name: Wait for RDP enable on DC03
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (rdp_dc03_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: rdp_dc03_result
+      until: rdp_dc03_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display RDP result for DC03
+      ansible.builtin.debug:
+        msg: "{{ rdp_dc03_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Verify Administrator Password on DC03
+    # --------------------------------------------------------------------------
+    - name: Verify Administrator password replicated to DC03
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["$admin = Get-ADUser Administrator -Properties PasswordLastSet; Write-Output \"Administrator password last set: $($admin.PasswordLastSet)\""]'
+          --output json
+      register: verify_pwd_cmd
+
+    - name: Wait for password verification
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (verify_pwd_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: verify_pwd_result
+      until: verify_pwd_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display password verification
+      ansible.builtin.debug:
+        msg: "DC03: {{ verify_pwd_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------------------------
+    - name: Configuration complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          RDP ACCESS CONFIGURED
+          ============================================
+          
+          Administrator password has been reset on all DCs.
+          RDP has been enabled on all DCs.
+          Administrator is in Remote Desktop Users group.
+          
+          Login Credentials:
+            Username: ORG\Administrator
+                 -or- Administrator@example.internal
+            Password: {{ ad_password }}
+          
+          Domain Controllers:
+            DC01: {{ dc01.private_ip }} ({{ dc01.region }})
+            DC02: {{ dc02.private_ip }} ({{ dc02.region }})
+            DC03: {{ dc03.private_ip }} ({{ dc03.region }})
+          
+          Connect via:
+            - AWS Fleet Manager RDP
+            - SSM Session Manager
+            - Direct RDP (if network allows)
+          ============================================

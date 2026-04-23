@@ -1,0 +1,58 @@
+# ==============================================================================
+# PLAYBOOK: list-users.yml
+# Lists AD users via SSM
+#
+# Usage:
+#   # List all users
+#   ansible-playbook user-management/list-users.yml
+#
+#   # List users in specific OU
+#   ansible-playbook user-management/list-users.yml -e "search_base='OU=Admins,DC=example,DC=internal'"
+#
+#   # Search for specific user
+#   ansible-playbook user-management/list-users.yml -e "filter='Name -like \"*john*\"'"
+#
+# ==============================================================================
+---
+- name: List Active Directory Users
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - ../vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+    search_base: "DC=example,DC=internal"
+    filter: "*"
+
+  tasks:
+    - name: List AD users
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Get-ADUser -Filter \"{{ filter }}\" -SearchBase \"{{ search_base }}\" -Properties DisplayName,EmailAddress,Department,Title,Enabled,Created,LastLogonDate | Format-Table SamAccountName,DisplayName,EmailAddress,Enabled,LastLogonDate -AutoSize"]'
+          --output json
+      register: list_cmd
+
+    - name: Wait for list command
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (list_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: list_result
+      until: list_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display users
+      ansible.builtin.debug:
+        msg: "{{ list_result.stdout }}"

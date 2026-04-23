@@ -1,0 +1,19 @@
+# ==============================================================================
+# PLAYBOOK: test-connection.yml
+# Simple test to verify SSM connectivity
+#
+# Run: ansible-playbook playbooks/test-connection.yml --limit dc01 -vvv
+# ==============================================================================
+---
+- name: Test SSM Connection
+  hosts: dc01
+  gather_facts: false
+
+  tasks:
+    - name: Simple whoami test
+      ansible.windows.win_shell: whoami
+      register: whoami_result
+
+    - name: Display result
+      ansible.builtin.debug:
+        var: whoami_result.stdout

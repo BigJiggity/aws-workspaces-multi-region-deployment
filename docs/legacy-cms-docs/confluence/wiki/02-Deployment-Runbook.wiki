@@ -1,0 +1,101 @@
+h1. Deployment Runbook
+
+h2. Prerequisites
+Install and configure:
+* Terraform
+* Terragrunt
+* AWS CLI v2
+* Authenticated AWS credentials with access to account `111122223333`
+
+Reference: `PREREQUISITES.md`
+
+h2. Recommended Deployment Order
+# Backend (Terraform state infrastructure)
+# Installs S3 bucket
+# WorkSpaces personal tiers
+# WorkSpaces pools
+
+h2. Backend Deployment
+{code:bash}
+cd backend/us-east-1
+terraform init
+terraform plan
+terraform apply
+{code}
+
+h2. Installs Bucket Deployment
+{code:bash}
+cd live/aws/aws-workspaces-platform/account-111122223333/us-east-1/installs-bucket
+terragrunt init
+terragrunt plan
+terragrunt apply
+{code}
+
+h2. Personal Tier Deployments
+h3. Standard
+{code:bash}
+cd live/aws/aws-workspaces-platform/account-111122223333/us-east-1/standard
+terragrunt init
+terragrunt plan
+terragrunt apply
+{code}
+
+h3. SOC
+{code:bash}
+cd live/aws/aws-workspaces-platform/account-111122223333/us-east-1/soc
+terragrunt init
+terragrunt plan
+terragrunt apply
+{code}
+
+h3. Dev
+{code:bash}
+cd live/aws/aws-workspaces-platform/account-111122223333/us-east-1/dev
+terragrunt init
+terragrunt plan
+terragrunt apply
+{code}
+
+h2. Pool Deployments
+Before pool apply:
+* Confirm `pool_directory_id = wsd-00000000` in `common.hcl`
+* Set `saml_xml_secret_arn` in each pool `terragrunt.hcl`
+
+h3. Standard Pool
+{code:bash}
+cd live/aws/aws-workspaces-platform/account-111122223333/us-east-1/standard-pool
+terragrunt init
+terragrunt plan
+terragrunt apply
+{code}
+
+h3. SOC Pool
+{code:bash}
+cd live/aws/aws-workspaces-platform/account-111122223333/us-east-1/soc-pool
+terragrunt init
+terragrunt plan
+terragrunt apply
+{code}
+
+h3. Dev Pool
+{code:bash}
+cd live/aws/aws-workspaces-platform/account-111122223333/us-east-1/dev-pool
+terragrunt init
+terragrunt plan
+terragrunt apply
+{code}
+
+h2. Interactive Script Option
+Use root scripts to guide deploy choice:
+* `./run-add-workspace.sh` (macOS/Linux)
+* `.\run-add-workspace.ps1` (Windows)
+
+Script prompts:
+# Deployment type: Personal Workspace or Workspace Pool
+# Tier: Standard, SOC, Dev
+
+h2. Post-Deployment Validation
+* Confirm Terraform outputs are present.
+* Verify WorkSpaces state in AWS console.
+* Validate target users/sessions and bundle assignment.
+* Confirm tags and naming standards on created resources.

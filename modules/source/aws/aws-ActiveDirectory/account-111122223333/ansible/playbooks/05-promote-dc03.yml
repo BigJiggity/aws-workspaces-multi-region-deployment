@@ -1,0 +1,252 @@
+# ==============================================================================
+# PLAYBOOK: 05-promote-dc03.yml
+# Promotes DC03 as replica domain controller in AP-Southeast-1
+#
+# Prerequisites:
+#   - DC01 and DC02 must be promoted
+#   - AD Sites must be configured (04-configure-sites.yml)
+#   - TGW peering must be active for cross-region connectivity
+#
+# Run: ansible-playbook playbooks/05-promote-dc03.yml
+# ==============================================================================
+---
+- name: Promote DC03 as Replica Domain Controller
+  hosts: dc03
+  gather_facts: true
+
+  pre_tasks:
+    - name: Validate required passwords are set
+      ansible.builtin.assert:
+        that:
+          - ad_safe_mode_password | length > 0
+          - ad_admin_password | length > 0
+        fail_msg: |
+          Required passwords not set. Please set environment variables:
+            export AD_SAFE_MODE_PASSWORD="YourPassword"
+            export AD_ADMIN_PASSWORD="YourPassword"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Check Current State
+    # --------------------------------------------------------------------------
+    - name: Check if already a domain controller
+      ansible.windows.win_shell: |
+        try {
+          $domain = Get-ADDomain -ErrorAction Stop
+          Write-Output "ALREADY_DC:$($domain.DNSRoot)"
+        } catch {
+          Write-Output "NOT_A_DC"
+        }
+      register: dc_check
+      ignore_errors: true
+
+    - name: Skip if already a domain controller
+      ansible.builtin.meta: end_play
+      when: "'ALREADY_DC' in dc_check.stdout"
+
+    # --------------------------------------------------------------------------
+    # Configure DNS to Point to US DCs
+    # --------------------------------------------------------------------------
+    - name: Configure DNS client to use DC01 and DC02
+      ansible.windows.win_shell: |
+        # DC01 and DC02 IPs (in us-east-2 management subnets)
+        # These should be reachable via TGW peering
+        $dnsServers = @()
+        
+        # Try to find DC01 and DC02 by scanning known subnets
+        $subnets = @("10.0.12", "10.0.13")
+        
+        foreach ($subnet in $subnets) {
+          for ($i = 1; $i -lt 50; $i++) {
+            $ip = "$subnet.$i"
+            $result = Test-NetConnection -ComputerName $ip -Port 53 -WarningAction SilentlyContinue -InformationLevel Quiet
+            if ($result) {
+              $dnsServers += $ip
+              Write-Output "Found DNS server: $ip"
+              break
+            }
+          }
+        }
+        
+        if ($dnsServers.Count -eq 0) {
+          Write-Output "ERROR: Could not find DNS servers in us-east-2"
+          exit 1
+        }
+        
+        $adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Name -notlike '*Loopback*' } | Select-Object -First 1
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $dnsServers
+        
+        Write-Output "DNS configured: $($dnsServers -join ', ')"
+      register: dns_config
+      retries: 3
+      delay: 30
+      until: dns_config.rc == 0
+
+    - name: Display DNS configuration
+      ansible.builtin.debug:
+        var: dns_config.stdout_lines
+
+    # --------------------------------------------------------------------------
+    # Verify Cross-Region Connectivity
+    # --------------------------------------------------------------------------
+    - name: Test connectivity to DC01
+      ansible.windows.win_shell: |
+        # Test LDAP port
+        $result = Test-NetConnection -ComputerName {{ ad_domain_name }} -Port 389 -WarningAction SilentlyContinue
+        if ($result.TcpTestSucceeded) {
+          Write-Output "LDAP connectivity to {{ ad_domain_name }}: OK"
+        } else {
+          Write-Output "LDAP connectivity to {{ ad_domain_name }}: FAILED"
+          exit 1
+        }
+      register: ldap_test
+      retries: 3
+      delay: 30
+      until: ldap_test.rc == 0
+
+    - name: Verify DNS resolution
+      ansible.windows.win_shell: |
+        $result = Resolve-DnsName -Name "{{ ad_domain_name }}" -Type SOA -ErrorAction Stop
+        Write-Output "DNS resolution successful:"
+        $result | Format-List | Out-String
+      register: dns_test
+      retries: 3
+      delay: 10
+      until: dns_test.rc == 0
+
+    - name: Display DNS test result
+      ansible.builtin.debug:
+        var: dns_test.stdout_lines
+
+    # --------------------------------------------------------------------------
+    # Promote as Replica DC in AP-Southeast-1 Site
+    # --------------------------------------------------------------------------
+    - name: Display promotion parameters
+      ansible.builtin.debug:
+        msg: |
+          Promoting DC03 as replica domain controller:
+            Domain: {{ ad_domain_name }}
+            Site: {{ ad_site_name }}
+            Region: ap-southeast-1
+
+    - name: Promote as replica domain controller
+      ansible.windows.win_shell: |
+        $securePassword = ConvertTo-SecureString "{{ ad_admin_password }}" -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential("{{ ad_netbios_name }}\Administrator", $securePassword)
+        $safeModePassword = ConvertTo-SecureString "{{ ad_safe_mode_password }}" -AsPlainText -Force
+        
+        $params = @{
+          DomainName                    = "{{ ad_domain_name }}"
+          SiteName                      = "{{ ad_site_name }}"
+          Credential                    = $credential
+          InstallDns                    = $true
+          CreateDnsDelegation           = $false
+          DatabasePath                  = "C:\Windows\NTDS"
+          LogPath                       = "C:\Windows\NTDS"
+          SysvolPath                    = "C:\Windows\SYSVOL"
+          SafeModeAdministratorPassword = $safeModePassword
+          NoRebootOnCompletion          = $false
+          Force                         = $true
+        }
+        
+        Install-ADDSDomainController @params
+      register: dc_install
+      async: 2400  # 40 minute timeout (cross-region replication takes longer)
+      poll: 30
+      no_log: true
+
+    # --------------------------------------------------------------------------
+    # Wait for Reboot
+    # --------------------------------------------------------------------------
+    - name: Wait for server to come back online
+      ansible.windows.win_wait_for_connection:
+        delay: 90
+        timeout: 900
+
+    - name: Wait for AD DS services to start
+      ansible.windows.win_shell: |
+        $maxAttempts = 40
+        $attempt = 0
+        
+        while ($attempt -lt $maxAttempts) {
+          $attempt++
+          try {
+            $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop
+            Write-Output "AD DS is ready: $($dc.HostName) in site $($dc.Site)"
+            exit 0
+          } catch {
+            Write-Output "Waiting for AD DS... (attempt $attempt/$maxAttempts)"
+            Start-Sleep -Seconds 15
+          }
+        }
+        
+        Write-Output "AD DS did not start in time"
+        exit 1
+      register: ad_ready
+      retries: 5
+      delay: 60
+      until: ad_ready.rc == 0
+
+    # --------------------------------------------------------------------------
+    # Post-Promotion Configuration
+    # --------------------------------------------------------------------------
+    - name: Configure DNS forwarders
+      ansible.windows.win_shell: |
+        $forwarders = @({{ dns_forwarders | map('quote') | join(', ') }})
+        Set-DnsServerForwarder -IPAddress $forwarders -PassThru
+      register: dns_forwarders_result
+
+    # --------------------------------------------------------------------------
+    # Verify Promotion
+    # --------------------------------------------------------------------------
+    - name: Verify domain controller status
+      ansible.windows.win_shell: |
+        $dc = Get-ADDomainController -Identity $env:COMPUTERNAME
+        $info = @{
+          Hostname = $dc.HostName
+          Domain = $dc.Domain
+          Forest = $dc.Forest
+          Site = $dc.Site
+          IsGlobalCatalog = $dc.IsGlobalCatalog
+          IPv4Address = $dc.IPv4Address
+        }
+        $info | ConvertTo-Json
+      register: dc_info
+
+    - name: Display domain controller info
+      ansible.builtin.debug:
+        var: dc_info.stdout | from_json
+
+    - name: Verify replication status
+      ansible.windows.win_shell: |
+        repadmin /replsummary
+      register: repl_summary
+
+    - name: Display replication summary
+      ansible.builtin.debug:
+        var: repl_summary.stdout_lines
+
+    - name: Check replication to DC01 and DC02
+      ansible.windows.win_shell: |
+        repadmin /showrepl $env:COMPUTERNAME
+      register: repl_status
+
+    - name: Display replication status
+      ansible.builtin.debug:
+        var: repl_status.stdout_lines
+
+    - name: Promotion complete
+      ansible.builtin.debug:
+        msg: |
+          DC03 has been promoted as a replica domain controller.
+          
+          Domain: {{ ad_domain_name }}
+          Site: {{ ad_site_name }}
+          
+          Domain Controllers:
+            - DC01 (us-east-2a) - Primary
+            - DC02 (us-east-2b) - Secondary
+            - DC03 (ap-southeast-1a) - Replica
+          
+          Next step:
+            Run 06-create-service-accounts.yml to create AD Connector service account

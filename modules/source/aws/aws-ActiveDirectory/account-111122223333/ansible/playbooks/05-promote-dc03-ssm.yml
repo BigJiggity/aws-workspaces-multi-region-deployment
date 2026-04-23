@@ -1,0 +1,593 @@
+# ==============================================================================
+# PLAYBOOK: 05-promote-dc03-ssm.yml
+# Prepares, joins, and promotes DC03 as replica DC in ap-southeast-1
+#
+# PREREQUISITES:
+#   1. Deploy firewall updates to ap-southeast-1 first!
+#   2. Verify TGW peering between regions is active
+#   3. DC01 and DC02 must be running
+#
+# Run: ansible-playbook playbooks/05-promote-dc03-ssm.yml
+# ==============================================================================
+---
+- name: Promote DC03 as Replica Domain Controller (AP-Southeast-1)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Load Secrets
+    # --------------------------------------------------------------------------
+    - name: Load secrets from AWS Secrets Manager
+      include_tasks: load-secrets.yml
+
+    # --------------------------------------------------------------------------
+    # Verify SSM Connectivity to DC03
+    # --------------------------------------------------------------------------
+    - name: Check SSM agent status for DC03
+      ansible.builtin.command:
+        cmd: >
+          aws ssm describe-instance-information
+          --region {{ dc03.region }}
+          --filters "Key=InstanceIds,Values={{ dc03.instance_id }}"
+          --query "InstanceInformationList[*].[InstanceId,PingStatus]"
+          --output text
+      register: ssm_status
+      changed_when: false
+
+    - name: Display SSM status
+      ansible.builtin.debug:
+        msg: "DC03 SSM Status: {{ ssm_status.stdout }}"
+
+    - name: Fail if DC03 SSM not online
+      ansible.builtin.fail:
+        msg: |
+          DC03 SSM agent is not online. 
+          Please ensure:
+            1. ap-southeast-1 firewall has management_bypass rules deployed
+            2. Instance is running
+            3. SSM endpoints are accessible
+      when: "'Online' not in ssm_status.stdout"
+
+    # --------------------------------------------------------------------------
+    # Disable Windows Firewall (Network Firewall handles perimeter security)
+    # --------------------------------------------------------------------------
+    - name: Disable Windows Firewall on DC03
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False; Write-Output \"Windows Firewall DISABLED on all profiles\""]'
+          --output json
+      register: fw_cmd
+
+    - name: Wait for firewall disable command
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (fw_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: fw_result
+      until: fw_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display firewall disable result
+      ansible.builtin.debug:
+        msg: "DC03: {{ fw_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Set DC01 IP (Using Static IP)
+    # --------------------------------------------------------------------------
+    - name: Set DC01 IP fact (static)
+      ansible.builtin.set_fact:
+        dc01_ip: "{{ dc01.private_ip }}"
+
+    - name: Display DC01 IP
+      ansible.builtin.debug:
+        msg: "DC01 IP: {{ dc01_ip }}"
+
+    # --------------------------------------------------------------------------
+    # Check if DC03 is Already a DC
+    # --------------------------------------------------------------------------
+    - name: Check if DC03 is already a domain controller
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["try { $d = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop; Write-Output \"ALREADY_DC:$($d.Domain)\" } catch { Write-Output \"NOT_A_DC\" }"]'
+          --output json
+      register: dc_check_cmd
+
+    - name: Wait for DC check
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (dc_check_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: dc_check_result
+      until: dc_check_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display DC check
+      ansible.builtin.debug:
+        msg: "DC03 status: {{ dc_check_result.stdout | trim }}"
+
+    - name: Skip if already a DC
+      ansible.builtin.meta: end_play
+      when: "'ALREADY_DC' in dc_check_result.stdout"
+
+    # --------------------------------------------------------------------------
+    # Prepare DC03 - Set Hostname and Install Features
+    # --------------------------------------------------------------------------
+    - name: Set hostname on DC03
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["if ($env:COMPUTERNAME -ne \"{{ dc03.hostname }}\") { Rename-Computer -NewName {{ dc03.hostname }} -Force -Restart } else { Write-Output \"Hostname OK\" }"]'
+          --output json
+      register: hostname_cmd
+
+    - name: Wait for hostname command
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (hostname_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: hostname_result
+      until: "(hostname_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 10
+      delay: 10
+
+    - name: Wait if hostname changed (reboot)
+      ansible.builtin.pause:
+        seconds: 120
+        prompt: "Waiting for potential reboot..."
+      when: "'Hostname OK' not in (hostname_result.stdout | from_json)[1]"
+
+    - name: Install AD DS features on DC03
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 600
+          --parameters commands='["Install-WindowsFeature -Name AD-Domain-Services,DNS,RSAT-AD-Tools,RSAT-DNS-Server,GPMC -IncludeManagementTools; Write-Output \"Features installed\""]'
+          --output json
+      register: features_cmd
+
+    - name: Wait for features installation
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (features_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: features_result
+      until: "(features_result.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut']"
+      retries: 30
+      delay: 20
+
+    - name: Display features result
+      ansible.builtin.debug:
+        msg: "{{ (features_result.stdout | from_json)[1] }}"
+
+    # --------------------------------------------------------------------------
+    # Check Domain Membership
+    # --------------------------------------------------------------------------
+    - name: Check if DC03 is domain joined
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["(Get-WmiObject Win32_ComputerSystem).Domain"]'
+          --output json
+      register: domain_check_cmd
+
+    - name: Wait for domain check
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (domain_check_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: domain_check_result
+      until: domain_check_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Set domain joined fact
+      ansible.builtin.set_fact:
+        is_domain_joined: "{{ 'example.internal' in (domain_check_result.stdout | lower) }}"
+
+    - name: Display domain status
+      ansible.builtin.debug:
+        msg: "DC03 current domain: {{ domain_check_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Configure DNS and Join Domain
+    # --------------------------------------------------------------------------
+    - name: Configure DC03 DNS to use DC01
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["$adapter = Get-NetAdapter | Where-Object { $_.Status -eq \"Up\" } | Select-Object -First 1; Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses @(\"{{ dc01_ip }}\"); Write-Output \"DNS set to {{ dc01_ip }}\""]'
+          --output json
+      register: dns_cmd
+      when: not is_domain_joined
+
+    - name: Wait for DNS configuration
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (dns_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: dns_result
+      until: dns_result is succeeded
+      retries: 10
+      delay: 5
+      when: not is_domain_joined
+
+    - name: Test connectivity to DC01
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["$r = Test-NetConnection -ComputerName {{ dc01_ip }} -Port 389 -WarningAction SilentlyContinue; if ($r.TcpTestSucceeded) { Write-Output \"CONNECTED\" } else { Write-Output \"FAILED\" }"]'
+          --output json
+      register: conn_test_cmd
+      when: not is_domain_joined
+
+    - name: Wait for connectivity test
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (conn_test_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: conn_test_result
+      until: conn_test_result is succeeded
+      retries: 10
+      delay: 5
+      when: not is_domain_joined
+
+    - name: Display connectivity test
+      ansible.builtin.debug:
+        msg: "Connectivity to DC01: {{ conn_test_result.stdout | trim }}"
+      when: not is_domain_joined
+
+    - name: Fail if cannot reach DC01
+      ansible.builtin.fail:
+        msg: "Cannot connect to DC01 from DC03. Check TGW peering and firewall rules."
+      when: not is_domain_joined and ('CONNECTED' not in conn_test_result.stdout)
+
+    - name: Join DC03 to domain using netdom
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["netdom join {{ dc03.hostname }} /domain:{{ ad_domain_name }} /UserD:{{ ad_netbios_name }}\\Administrator /PasswordD:{{ ad_password }} /REBoot:30"]'
+          --output json
+      register: join_cmd
+      when: not is_domain_joined
+
+    - name: Wait for domain join command
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (join_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: join_result
+      until: "(join_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 10
+      delay: 10
+      when: not is_domain_joined
+
+    - name: Display join result
+      ansible.builtin.debug:
+        msg: "{{ (join_result.stdout | from_json)[1] }}"
+      when: not is_domain_joined
+
+    - name: Wait for reboot after domain join
+      ansible.builtin.pause:
+        seconds: 150
+        prompt: "Waiting 2.5 minutes for DC03 to reboot..."
+      when: not is_domain_joined
+
+    - name: Wait for SSM agent online
+      ansible.builtin.command:
+        cmd: >
+          aws ssm describe-instance-information
+          --region {{ dc03.region }}
+          --filters "Key=InstanceIds,Values={{ dc03.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: ssm_ping
+      until: ssm_ping.stdout == "Online"
+      retries: 20
+      delay: 15
+      when: not is_domain_joined
+
+    # --------------------------------------------------------------------------
+    # Promote DC03 to Domain Controller
+    # --------------------------------------------------------------------------
+    - name: Promote DC03 as replica domain controller
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 1800
+          --parameters commands='["$safePw = ConvertTo-SecureString \"{{ ad_password }}\" -AsPlainText -Force; $adminPw = ConvertTo-SecureString \"{{ ad_password }}\" -AsPlainText -Force; $cred = New-Object System.Management.Automation.PSCredential(\"{{ ad_netbios_name }}\\Administrator\", $adminPw); Install-ADDSDomainController -DomainName \"{{ ad_domain_name }}\" -SiteName \"{{ dc03.site }}\" -InstallDns:$true -Credential $cred -SafeModeAdministratorPassword $safePw -DatabasePath \"C:\\Windows\\NTDS\" -LogPath \"C:\\Windows\\NTDS\" -SysvolPath \"C:\\Windows\\SYSVOL\" -NoRebootOnCompletion:$false -Force:$true; Write-Output \"PROMOTION_COMPLETE\""]'
+          --output json
+      register: promote_cmd
+
+    - name: Display promotion command ID
+      ansible.builtin.debug:
+        msg: "DC03 promotion command ID: {{ (promote_cmd.stdout | from_json).Command.CommandId }}"
+
+    - name: Wait for promotion command
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (promote_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: promote_status
+      until: "(promote_status.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut', 'Cancelled']"
+      retries: 30
+      delay: 30
+      ignore_errors: true
+
+    # --------------------------------------------------------------------------
+    # Wait for Reboot After Promotion
+    # --------------------------------------------------------------------------
+    - name: Wait for DC03 to reboot after promotion
+      ansible.builtin.pause:
+        seconds: 240
+        prompt: "Waiting 4 minutes for DC03 to reboot (cross-region replication takes longer)..."
+
+    - name: Wait for SSM agent online after promotion
+      ansible.builtin.command:
+        cmd: >
+          aws ssm describe-instance-information
+          --region {{ dc03.region }}
+          --filters "Key=InstanceIds,Values={{ dc03.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: ssm_ping_promo
+      until: ssm_ping_promo.stdout == "Online"
+      retries: 25
+      delay: 15
+
+    # --------------------------------------------------------------------------
+    # Verify DC Promotion
+    # --------------------------------------------------------------------------
+    - name: Wait for AD DS to be operational on DC03
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["$attempts = 0; while ($attempts -lt 40) { $attempts++; try { $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop; Write-Output \"SUCCESS:$($dc.Domain):$($dc.Site)\"; exit 0 } catch { Write-Output \"Waiting... (attempt $attempts)\"; Start-Sleep 15 } }; Write-Output \"FAILED\"; exit 1"]'
+          --output json
+      register: verify_dc_cmd
+
+    - name: Wait for DC verification
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (verify_dc_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: verify_dc_result
+      until: "(verify_dc_result.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut']"
+      retries: 25
+      delay: 30
+
+    - name: Display DC verification
+      ansible.builtin.debug:
+        msg: "{{ (verify_dc_result.stdout | from_json)[1] }}"
+
+    - name: Fail if AD DS not running
+      ansible.builtin.fail:
+        msg: "AD DS failed to start on DC03"
+      when: "'SUCCESS' not in (verify_dc_result.stdout | from_json)[1]"
+
+    # --------------------------------------------------------------------------
+    # Enable RDP on DC03
+    # --------------------------------------------------------------------------
+    - name: Enable RDP on DC03
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Set-ItemProperty -Path \"HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server\" -Name \"fDenyTSConnections\" -Value 0; Enable-NetFirewallRule -DisplayGroup \"Remote Desktop\" -ErrorAction SilentlyContinue; Write-Output \"RDP enabled on DC03\""]'
+          --output json
+      register: rdp_cmd
+
+    - name: Wait for RDP enable
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (rdp_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: rdp_result
+      until: rdp_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display RDP result
+      ansible.builtin.debug:
+        msg: "{{ rdp_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Configure DNS Forwarders on DC03
+    # --------------------------------------------------------------------------
+    - name: Configure DNS forwarders on DC03
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Set-DnsServerForwarder -IPAddress @(\"169.254.169.253\",\"8.8.8.8\") -PassThru | Format-List"]'
+          --output json
+      register: dns_fwd_cmd
+
+    - name: Wait for DNS forwarders
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (dns_fwd_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: dns_fwd_result
+      until: dns_fwd_result is succeeded
+      retries: 10
+      delay: 5
+
+    # --------------------------------------------------------------------------
+    # Check Replication Status
+    # --------------------------------------------------------------------------
+    - name: Check replication status
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["repadmin /replsummary; Write-Output \"\n=== Replication Partners ===\"; repadmin /showrepl | Select-String -Pattern \"DSA|DC=\""]'
+          --output json
+      register: repl_cmd
+
+    - name: Wait for replication check
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (repl_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: repl_result
+      until: repl_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display replication status
+      ansible.builtin.debug:
+        msg: "{{ repl_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Get DC03 Information
+    # --------------------------------------------------------------------------
+    - name: Get DC03 information
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc03.region }}
+          --instance-ids {{ dc03.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["$dc = Get-ADDomainController -Identity $env:COMPUTERNAME; Write-Output \"Hostname: $($dc.HostName)\"; Write-Output \"Domain: $($dc.Domain)\"; Write-Output \"Site: $($dc.Site)\"; Write-Output \"IsGC: $($dc.IsGlobalCatalog)\"; Write-Output \"IP: $($dc.IPv4Address)\""]'
+          --output json
+      register: info_cmd
+
+    - name: Wait for info command
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc03.region }}
+          --command-id {{ (info_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc03.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: info_result
+      until: info_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display DC03 info
+      ansible.builtin.debug:
+        msg: "{{ info_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Complete
+    # --------------------------------------------------------------------------
+    - name: DC03 promotion complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          DC03 PROMOTION COMPLETE
+          ============================================
+          
+          DC03 is now a replica domain controller
+          in the AP-Southeast-1 site.
+          
+          Domain: {{ ad_domain_name }}
+          Site: {{ dc03.site }}
+          
+          Cross-region AD replication is now active
+          between US-East-2 and AP-Southeast-1.
+          
+          Next step: Run 06-create-service-accounts-ssm.yml
+          ============================================

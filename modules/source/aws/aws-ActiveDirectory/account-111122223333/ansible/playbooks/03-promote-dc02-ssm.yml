@@ -1,0 +1,420 @@
+# ==============================================================================
+# PLAYBOOK: 03-promote-dc02-ssm.yml
+# Joins DC02 to domain and promotes as secondary domain controller
+#
+# IMPORTANT: Uses netdom instead of Add-Computer (more reliable)
+#
+# Run: ansible-playbook playbooks/03-promote-dc02-ssm.yml
+# ==============================================================================
+---
+- name: Promote DC02 as Secondary Domain Controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Load Secrets
+    # --------------------------------------------------------------------------
+    - name: Load secrets from AWS Secrets Manager
+      include_tasks: load-secrets.yml
+
+    # --------------------------------------------------------------------------
+    # Set DC01 IP (Using Static IP)
+    # --------------------------------------------------------------------------
+    - name: Set DC01 IP fact (static)
+      ansible.builtin.set_fact:
+        dc01_ip: "{{ dc01.private_ip }}"
+
+    - name: Display DC01 IP
+      ansible.builtin.debug:
+        msg: "DC01 IP: {{ dc01_ip }}"
+
+    # --------------------------------------------------------------------------
+    # Check if DC02 is already a DC
+    # --------------------------------------------------------------------------
+    - name: Check if DC02 is already a domain controller
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["try { $d = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop; Write-Output \"ALREADY_DC:$($d.Domain)\" } catch { Write-Output \"NOT_A_DC\" }"]}'
+          --output json
+      register: dc_check_cmd
+
+    - name: Wait for DC check
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ (dc_check_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: dc_check_result
+      until: dc_check_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display DC check
+      ansible.builtin.debug:
+        msg: "DC02 status: {{ dc_check_result.stdout | trim }}"
+
+    - name: Skip if already a DC
+      ansible.builtin.meta: end_play
+      when: "'ALREADY_DC' in dc_check_result.stdout"
+
+    # --------------------------------------------------------------------------
+    # Check Domain Membership
+    # --------------------------------------------------------------------------
+    - name: Check if DC02 is domain joined
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["(Get-WmiObject Win32_ComputerSystem).Domain"]}'
+          --output json
+      register: domain_check_cmd
+
+    - name: Wait for domain check
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ (domain_check_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: domain_check_result
+      until: domain_check_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Set domain joined fact
+      ansible.builtin.set_fact:
+        is_domain_joined: "{{ 'example.internal' in (domain_check_result.stdout | lower) }}"
+
+    - name: Display domain status
+      ansible.builtin.debug:
+        msg: "DC02 current domain: {{ domain_check_result.stdout | trim }} (joined: {{ is_domain_joined }})"
+
+    # --------------------------------------------------------------------------
+    # Configure DNS to Point to DC01
+    # --------------------------------------------------------------------------
+    - name: Configure DC02 DNS to use DC01
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["$adapter = Get-NetAdapter | Where-Object { $_.Status -eq \"Up\" } | Select-Object -First 1; Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses @(\"{{ dc01_ip }}\"); Write-Output \"DNS set to {{ dc01_ip }}\""]}'
+          --output json
+      register: dns_cmd
+      when: not is_domain_joined
+
+    - name: Wait for DNS configuration
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ (dns_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: dns_result
+      until: dns_result is succeeded
+      retries: 10
+      delay: 5
+      when: not is_domain_joined
+
+    # --------------------------------------------------------------------------
+    # Join Domain Using netdom (More Reliable Than Add-Computer)
+    # --------------------------------------------------------------------------
+    - name: Join DC02 to domain using netdom
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["netdom join {{ dc02.hostname }} /domain:{{ ad_domain_name }} /UserD:{{ ad_netbios_name }}\\Administrator /PasswordD:{{ ad_password }} /REBoot:30"]}'
+          --output json
+      register: join_cmd
+      when: not is_domain_joined
+
+    - name: Wait for domain join command
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ (join_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: join_result
+      until: "(join_result.stdout | from_json)[0] in ['Success', 'Failed']"
+      retries: 10
+      delay: 10
+      when: not is_domain_joined
+
+    - name: Display join result
+      ansible.builtin.debug:
+        msg: |
+          Status: {{ (join_result.stdout | from_json)[0] }}
+          Output: {{ (join_result.stdout | from_json)[1] }}
+      when: not is_domain_joined
+
+    - name: Fail if domain join failed
+      ansible.builtin.fail:
+        msg: "Domain join failed: {{ (join_result.stdout | from_json)[2] }}"
+      when: not is_domain_joined and ('completed successfully' not in ((join_result.stdout | from_json)[1] | lower))
+
+    # --------------------------------------------------------------------------
+    # Wait for Reboot After Domain Join
+    # --------------------------------------------------------------------------
+    - name: Wait for reboot after domain join
+      ansible.builtin.pause:
+        seconds: 120
+        prompt: "Waiting 2 minutes for DC02 to reboot after domain join..."
+      when: not is_domain_joined
+
+    - name: Wait for SSM agent to come back online
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc02.region }}
+          --filters "Key=InstanceIds,Values={{ dc02.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: ssm_ping
+      until: ssm_ping.stdout == "Online"
+      retries: 20
+      delay: 15
+      when: not is_domain_joined
+
+    # --------------------------------------------------------------------------
+    # Verify Domain Membership
+    # --------------------------------------------------------------------------
+    - name: Verify DC02 is domain joined
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["(Get-WmiObject Win32_ComputerSystem).Domain"]}'
+          --output json
+      register: verify_domain_cmd
+
+    - name: Wait for domain verification
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ (verify_domain_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: verify_domain_result
+      until: verify_domain_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Confirm domain membership
+      ansible.builtin.debug:
+        msg: "DC02 is now joined to: {{ verify_domain_result.stdout | trim }}"
+
+    - name: Fail if not domain joined
+      ansible.builtin.fail:
+        msg: "DC02 is not domain joined!"
+      when: "'example.internal' not in verify_domain_result.stdout | lower"
+
+    # --------------------------------------------------------------------------
+    # Promote DC02 to Domain Controller
+    # --------------------------------------------------------------------------
+    - name: Promote DC02 as additional domain controller
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --timeout-seconds 1800
+          --parameters '{"commands":["$safePw = ConvertTo-SecureString \"{{ ad_password }}\" -AsPlainText -Force; $adminPw = ConvertTo-SecureString \"{{ ad_password }}\" -AsPlainText -Force; $cred = New-Object System.Management.Automation.PSCredential(\"{{ ad_netbios_name }}\\Administrator\", $adminPw); Install-ADDSDomainController -DomainName \"{{ ad_domain_name }}\" -InstallDns:$true -Credential $cred -SafeModeAdministratorPassword $safePw -DatabasePath \"C:\\Windows\\NTDS\" -LogPath \"C:\\Windows\\NTDS\" -SysvolPath \"C:\\Windows\\SYSVOL\" -NoRebootOnCompletion:$false -Force:$true; Write-Output \"PROMOTION_COMPLETE\""]}'
+          --output json
+      register: promote_cmd
+
+    - name: Get promotion command ID
+      ansible.builtin.set_fact:
+        promote_cmd_id: "{{ (promote_cmd.stdout | from_json).Command.CommandId }}"
+
+    - name: Display promotion command ID
+      ansible.builtin.debug:
+        msg: "DC promotion command ID: {{ promote_cmd_id }} - Server will reboot"
+
+    - name: Wait for promotion command
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ promote_cmd_id }}
+          --instance-id {{ dc02.instance_id }}
+          --query "[Status,StandardOutputContent,StandardErrorContent]"
+          --output json
+      register: promote_status
+      until: "(promote_status.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut', 'Cancelled']"
+      retries: 30
+      delay: 30
+      ignore_errors: true
+
+    # --------------------------------------------------------------------------
+    # Wait for Reboot After Promotion
+    # --------------------------------------------------------------------------
+    - name: Wait for DC02 to reboot after promotion
+      ansible.builtin.pause:
+        seconds: 180
+        prompt: "Waiting 3 minutes for DC02 to reboot and AD DS to start..."
+
+    - name: Wait for SSM agent online after promotion
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm describe-instance-information
+          --region {{ dc02.region }}
+          --filters "Key=InstanceIds,Values={{ dc02.instance_id }}"
+          --query "InstanceInformationList[0].PingStatus"
+          --output text
+      register: ssm_ping_promo
+      until: ssm_ping_promo.stdout == "Online"
+      retries: 20
+      delay: 15
+
+    # --------------------------------------------------------------------------
+    # Verify DC Promotion
+    # --------------------------------------------------------------------------
+    - name: Wait for AD DS to be operational
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["$attempts = 0; while ($attempts -lt 30) { $attempts++; try { $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop; Write-Output \"SUCCESS:$($dc.Domain)\"; exit 0 } catch { Write-Output \"Waiting... (attempt $attempts)\"; Start-Sleep 10 } }; Write-Output \"FAILED\"; exit 1"]}'
+          --output json
+      register: verify_dc_cmd
+
+    - name: Wait for DC verification
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ (verify_dc_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02.instance_id }}
+          --query "[Status,StandardOutputContent]"
+          --output json
+      register: verify_dc_result
+      until: "(verify_dc_result.stdout | from_json)[0] in ['Success', 'Failed', 'TimedOut']"
+      retries: 20
+      delay: 30
+
+    - name: Display DC verification
+      ansible.builtin.debug:
+        msg: "{{ (verify_dc_result.stdout | from_json)[1] }}"
+
+    - name: Fail if AD DS not running
+      ansible.builtin.fail:
+        msg: "AD DS failed to start on DC02"
+      when: "'SUCCESS' not in (verify_dc_result.stdout | from_json)[1]"
+
+    # --------------------------------------------------------------------------
+    # Check Replication
+    # --------------------------------------------------------------------------
+    - name: Check replication status
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["repadmin /replsummary"]}'
+          --output json
+      register: repl_cmd
+
+    - name: Wait for replication check
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ (repl_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: repl_result
+      until: repl_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display replication status
+      ansible.builtin.debug:
+        msg: "{{ repl_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Get DC02 Information
+    # --------------------------------------------------------------------------
+    - name: Get DC02 information
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm send-command
+          --region {{ dc02.region }}
+          --instance-ids {{ dc02.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters '{"commands":["$dc = Get-ADDomainController -Identity $env:COMPUTERNAME; Write-Output \"Hostname: $($dc.HostName)\"; Write-Output \"Domain: $($dc.Domain)\"; Write-Output \"Site: $($dc.Site)\"; Write-Output \"IsGC: $($dc.IsGlobalCatalog)\"; Write-Output \"IP: $($dc.IPv4Address)\""]}'
+          --output json
+      register: info_cmd
+
+    - name: Wait for info command
+      ansible.builtin.command:
+        cmd: >-
+          aws ssm get-command-invocation
+          --region {{ dc02.region }}
+          --command-id {{ (info_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc02.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: info_result
+      until: info_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display DC02 info
+      ansible.builtin.debug:
+        msg: "{{ info_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Complete
+    # --------------------------------------------------------------------------
+    - name: Promotion complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          DC02 PROMOTION COMPLETE
+          ============================================
+          
+          DC02 is now a domain controller for {{ ad_domain_name }}
+          replicating with DC01.
+          
+          Next steps:
+            1. Run 04-configure-sites-ssm.yml
+            2. Deploy ap-southeast-1 firewall updates
+            3. Run 05-promote-dc03-ssm.yml
+          ============================================

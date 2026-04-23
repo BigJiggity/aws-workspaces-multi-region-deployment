@@ -1,0 +1,103 @@
+# ==============================================================================
+# GROUP VARIABLES - All Hosts
+# Generic AWS AD account-111122223333
+#
+# IMPORTANT: Passwords should NOT contain special shell characters like ! $ ` \
+# Use alphanumeric with @ or # if needed (e.g., P@ssw0rd123)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Instance Configuration
+# ------------------------------------------------------------------------------
+dc_servers:
+  dc01:
+    instance_id: "i-0b8af16d1e6126ada"
+    hostname: "DC01"
+    region: "us-east-2"
+    role: "primary"
+    site: "US-East-2"
+    subnet_prefix: "10.0.12"
+  dc02:
+    instance_id: "i-07847093f3e08bfd9"
+    hostname: "DC02"
+    region: "us-east-2"
+    role: "secondary"
+    site: "US-East-2"
+    subnet_prefix: "10.0.13"
+  dc03:
+    instance_id: "i-041a564f209197fb9"
+    hostname: "DC03"
+    region: "ap-southeast-1"
+    role: "replica"
+    site: "AP-Southeast-1"
+    subnet_prefix: "10.2.10"
+
+# ------------------------------------------------------------------------------
+# Active Directory Configuration
+# ------------------------------------------------------------------------------
+ad_domain_name: "example.internal"
+ad_netbios_name: "ORG"
+ad_forest_mode: "WinThreshold"
+ad_domain_mode: "WinThreshold"
+
+# Passwords - Set via environment variables or override here
+# IMPORTANT: Avoid special characters (! $ ` \) to prevent shell escaping issues
+ad_password: "P@ssw0rd123"
+
+# ------------------------------------------------------------------------------
+# AD Sites Configuration
+# ------------------------------------------------------------------------------
+ad_sites:
+  - name: "US-East-2"
+    subnet: "10.0.0.0/16"
+  - name: "AP-Southeast-1"
+    subnet: "10.2.0.0/16"
+
+ad_site_link:
+  name: "US-East-2-to-AP-Southeast-1"
+  sites:
+    - "US-East-2"
+    - "AP-Southeast-1"
+  cost: 100
+  replication_interval: 15
+
+# ------------------------------------------------------------------------------
+# Service Accounts
+# ------------------------------------------------------------------------------
+service_accounts:
+  - name: "svc_adconnector"
+    description: "Service account for AWS AD Connector"
+    groups:
+      - "Domain Admins"
+    password_never_expires: true
+  - name: "svc_workspaces"
+    description: "Service account for AWS WorkSpaces"
+    groups:
+      - "Domain Users"
+    password_never_expires: true
+
+# ------------------------------------------------------------------------------
+# DNS Configuration
+# ------------------------------------------------------------------------------
+dns_forwarders:
+  - "169.254.169.253"  # AWS VPC DNS
+  - "8.8.8.8"          # Google DNS fallback
+
+# ------------------------------------------------------------------------------
+# Windows Features to Install
+# ------------------------------------------------------------------------------
+windows_features:
+  - "AD-Domain-Services"
+  - "DNS"
+  - "RSAT-AD-Tools"
+  - "RSAT-DNS-Server"
+  - "GPMC"
+
+# ------------------------------------------------------------------------------
+# Timing Configuration
+# ------------------------------------------------------------------------------
+reboot_wait_seconds: 180
+ssm_retry_count: 20
+ssm_retry_delay: 15
+adds_wait_attempts: 30
+adds_wait_delay: 10

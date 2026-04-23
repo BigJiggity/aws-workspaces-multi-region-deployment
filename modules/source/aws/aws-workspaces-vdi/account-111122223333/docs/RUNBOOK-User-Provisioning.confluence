@@ -1,0 +1,437 @@
+h1. WorkSpaces User Provisioning Runbook
+
+h2. Overview
+
+This runbook guides you through the complete process of provisioning a new user with an Amazon WorkSpace. By the end, you'll have:
+* A new Active Directory user account
+* The user added to the correct security groups (including local admin rights)
+* A WorkSpace deployed and assigned to that user
+
+*Estimated Time:* 15-20 minutes
+
+----
+
+h2. Prerequisites
+
+Before starting, ensure you have:
+
+{status:colour=Grey|title=Access to the Ansible control machine (your local Mac with the repos)}
+{status:colour=Grey|title=AWS CLI configured with appropriate permissions}
+{status:colour=Grey|title=Access to the cloud_infrastructure repository}
+{status:colour=Grey|title=The user's information (name, email, desired username)}
+
+*Repository Locations:*
+||Project||Path||
+|AD Management|{{~/Repos/cloud_infrastructure/account-111122223333}}|
+|WorkSpaces|{{~/Repos/cloud_infrastructure/org-workspaces-vdi}}|
+
+----
+
+h2. Step 1: Create the AD User Account
+
+h3. Option A: Using the Ansible Playbook (Recommended)
+
+{panel:title=Step 1.1 - Navigate to the AD project|borderStyle=solid|borderColor=#ccc}
+{code:language=bash}
+cd ~/Repos/cloud_infrastructure/account-111122223333/ansible
+{code}
+{panel}
+
+{panel:title=Step 1.2 - Edit the users file|borderStyle=solid|borderColor=#ccc}
+{code:language=bash}
+vim playbooks/user-management/users.yml
+{code}
+{panel}
+
+{panel:title=Step 1.3 - Add the new user entry|borderStyle=solid|borderColor=#ccc}
+{code:language=yaml}
+ad_users:
+  # ... existing users ...
+  
+  - username: <username>                # Login name (no spaces, lowercase)
+    display_name: "<Full Name>"         # Full name as it appears in AD
+    password: "{{ default_password }}"  # Uses default password from vars
+    email: "<username>@example.internal"         # Email address
+    groups:
+      - "Domain Users"
+      - "WorkSpaces-LocalAdmins"        # IMPORTANT: Gives local admin on WorkSpace
+    description: "Standard user account"
+    must_change_password: false         # Set to true if user should change password on first login
+{code}
+{panel}
+
+{panel:title=Step 1.4 - Save and run the playbook|borderStyle=solid|borderColor=#ccc}
+Save the file ({{:wq}} in vim), then run:
+{code:language=bash}
+ansible-playbook playbooks/user-management/manage-users.yml -v
+{code}
+{panel}
+
+{panel:title=Step 1.5 - Verify the user was created|borderStyle=solid|borderColor=#ccc}
+{code:language=bash}
+ansible-playbook playbooks/user-management/list-users.yml
+{code}
+{panel}
+
+h3. Option B: Create User with Custom Password
+
+If you want to specify a password instead of using the default:
+{code:language=bash}
+ansible-playbook playbooks/user-management/manage-users.yml -e "default_password=<YOUR_SECURE_PASSWORD>"
+{code}
+
+{info:title=Password Information}
+*Default Password Location:* The default password is defined in {{playbooks/user-management/users.yml}} in the {{default_password}} variable.
+
+*Credentials Storage:* All production credentials are stored in AWS Secrets Manager:
+* *Secret Name:* {{org-infrastructure/credentials}}
+* *Region:* {{us-east-2}}
+
+To retrieve credentials:
+{code:language=bash}
+aws secretsmanager get-secret-value \
+  --region us-east-2 \
+  --secret-id org-infrastructure/credentials \
+  --query SecretString --output text | jq .
+{code}
+{info}
+
+----
+
+h2. Step 2: Verify User Configuration
+
+h3. Check User Details
+
+Run this command to verify the user was created correctly:
+{code:language=bash}
+CMD_ID=$(aws ssm send-command \
+  --region us-east-2 \
+  --instance-ids i-0e5f7fdd4219cc530 \
+  --document-name "AWS-RunPowerShellScript" \
+  --parameters 'commands=["Get-ADUser -Identity <USERNAME> -Properties DisplayName,EmailAddress,MemberOf | Format-List"]' \
+  --output json | jq -r '.Command.CommandId') && \
+sleep 5 && \
+aws ssm get-command-invocation \
+  --region us-east-2 \
+  --command-id $CMD_ID \
+  --instance-id i-0e5f7fdd4219cc530 \
+  --query "StandardOutputContent" \
+  --output text
+{code}
+
+{note}
+Replace {{<USERNAME>}} with the actual username you created.
+{note}
+
+h3. Expected Output
+
+You should see:
+* {{DisplayName}} matches what you entered
+* {{EmailAddress}} is correct
+* {{MemberOf}} includes:
+** {{CN=Domain Users,CN=Users,DC=example,DC=internal}}
+** {{CN=WorkSpaces-LocalAdmins,OU=Groups,DC=example,DC=internal}}
+
+h3. Troubleshooting: Add User to LocalAdmins Group Manually
+
+If the user is missing from {{WorkSpaces-LocalAdmins}}:
+{code:language=bash}
+aws ssm send-command \
+  --region us-east-2 \
+  --instance-ids i-0e5f7fdd4219cc530 \
+  --document-name "AWS-RunPowerShellScript" \
+  --parameters 'commands=["Add-ADGroupMember -Identity \"WorkSpaces-LocalAdmins\" -Members \"<USERNAME>\""]' \
+  --output json
+{code}
+
+----
+
+h2. Step 3: Deploy the WorkSpace
+
+h3. 3.1 Navigate to WorkSpaces Project
+
+{code:language=bash}
+cd ~/Repos/cloud_infrastructure/org-workspaces-vdi
+{code}
+
+h3. 3.2 Edit the Terraform Variables
+
+{code:language=bash}
+vim terraform.tfvars
+{code}
+
+h3. 3.3 Add the New User to the WorkSpaces List
+
+Find the {{workspaces_users}} section and add the new user:
+{code:language=hcl}
+workspaces_users = [
+  # Existing users...
+  
+  {
+    username    = "<username>"       # Must match the AD username exactly
+    bundle_id   = "wsb-09fdsggz9"    # Standard Windows 10 bundle
+    volume_encryption_enabled = true
+    user_volume_size = 50            # User drive size in GB
+    root_volume_size = 80            # System drive size in GB
+    tags = {
+      Department = "<Department>"    # Optional: customize as needed
+      Owner      = "<Full Name>"
+    }
+  }
+]
+{code}
+
+h3. 3.4 Save and Apply Terraform
+
+{code:language=bash}
+# Preview what will be created
+terraform plan
+
+# Apply the changes (creates the WorkSpace)
+terraform apply
+{code}
+
+Type {{yes}} when prompted to confirm.
+
+h3. 3.5 Wait for WorkSpace Provisioning
+
+{warning}
+WorkSpace provisioning takes approximately *15-20 minutes*.
+{warning}
+
+You can monitor progress in the AWS Console:
+# Go to AWS Console → WorkSpaces
+# Select the *ap-southeast-1* region (or us-east-2 depending on deployment)
+# Find the new WorkSpace in the list
+# Status will progress: {{PENDING}} → {{STARTING}} → {{AVAILABLE}}
+
+----
+
+h2. Step 4: Post-Deployment Configuration
+
+Once the WorkSpace is {{AVAILABLE}}, the following happens automatically via GPO:
+
+h3. Automatic Configurations (via Group Policy)
+
+||Configuration||Description||
+|Local Admin Rights|User is added to local Administrators group (from WorkSpaces-LocalAdmins membership)|
+|S3 Installers Drive|S: drive is mounted with access to software installers|
+
+h3. Verify Local Admin Rights
+
+After the user logs in, they can verify admin rights:
+# Open PowerShell as the user
+# Run: {{net localgroup Administrators}}
+# Should see {{ORG\WorkSpaces-LocalAdmins}} or the username in the list
+
+----
+
+h2. Step 5: Provide User with Login Information
+
+Send the following information to the new user:
+
+{panel:title=Email Template for New User|borderStyle=solid|borderColor=#0052CC|bgColor=#E6FCFF}
+Your Amazon WorkSpace is ready!
+
+*WorkSpace Login:*
+* Registration Code: \[Get from AWS Console - see instructions below\]
+* Username: {{ORG\<username>}}
+* Password: \[Provide securely - see password lookup instructions below\]
+
+*To connect:*
+# Download Amazon WorkSpaces client from: [https://clients.amazonworkspaces.com/]
+# Open the client and enter the registration code
+# Log in with your credentials above
+
+*Your WorkSpace includes:*
+* S: drive with software installers
+* Local administrator access for installing software
+
+If you have issues, contact the IT team.
+{panel}
+
+h3. Get Registration Code
+
+{code:language=bash}
+aws workspaces describe-workspaces \
+  --region ap-southeast-1 \
+  --query "Workspaces[?UserName=='<username>'].{User:UserName,State:State,RegCode:ComputerName}" \
+  --output table
+{code}
+
+Or find it in AWS Console → WorkSpaces → Directory → Registration Code
+
+h3. Retrieve User Password
+
+{info:title=Password Retrieval}
+User passwords should be communicated securely to the end user. Retrieve the default password from:
+
+*Option 1: Check users.yml*
+{code:language=bash}
+cat ~/Repos/cloud_infrastructure/account-111122223333/ansible/playbooks/user-management/users.yml | grep default_password
+{code}
+
+*Option 2: AWS Secrets Manager*
+{code:language=bash}
+aws secretsmanager get-secret-value \
+  --region us-east-2 \
+  --secret-id org-infrastructure/credentials \
+  --query SecretString --output text | jq .
+{code}
+
+*Best Practice:* Communicate passwords via a secure channel (e.g., encrypted email, password manager share, or in-person). Never send passwords in plain text emails.
+{info}
+
+----
+
+h2. Quick Reference Commands
+
+{expand:title=List All AD Users}
+{code:language=bash}
+cd ~/Repos/cloud_infrastructure/account-111122223333/ansible
+ansible-playbook playbooks/user-management/list-users.yml
+{code}
+{expand}
+
+{expand:title=Reset User Password}
+{code:language=bash}
+aws ssm send-command \
+  --region us-east-2 \
+  --instance-ids i-0e5f7fdd4219cc530 \
+  --document-name "AWS-RunPowerShellScript" \
+  --parameters 'commands=["Set-ADAccountPassword -Identity <USERNAME> -Reset -NewPassword (ConvertTo-SecureString \"<NEW_PASSWORD>\" -AsPlainText -Force)"]' \
+  --output json
+{code}
+{expand}
+
+{expand:title=Disable a User}
+{code:language=bash}
+cd ~/Repos/cloud_infrastructure/account-111122223333/ansible
+ansible-playbook playbooks/user-management/manage-users.yml -e "user_action=disable"
+{code}
+{expand}
+
+{expand:title=Reboot a WorkSpace}
+{code:language=bash}
+aws workspaces reboot-workspaces \
+  --region ap-southeast-1 \
+  --reboot-workspace-requests WorkspaceId=<WORKSPACE_ID>
+{code}
+{expand}
+
+{expand:title=Check WorkSpace Status}
+{code:language=bash}
+aws workspaces describe-workspaces \
+  --region ap-southeast-1 \
+  --query "Workspaces[*].{User:UserName,State:State,IP:IpAddress}" \
+  --output table
+{code}
+{expand}
+
+----
+
+h2. Troubleshooting
+
+{expand:title=User Can't Log In to WorkSpace}
+*1. Verify AD account is enabled:*
+{code:language=bash}
+aws ssm send-command \
+  --region us-east-2 \
+  --instance-ids i-0e5f7fdd4219cc530 \
+  --document-name "AWS-RunPowerShellScript" \
+  --parameters 'commands=["Get-ADUser -Identity <USERNAME> -Properties Enabled | Select Enabled"]' \
+  --output json
+{code}
+
+*2. Reset password if needed* (see Quick Reference above)
+
+*3. Check AD Connector health* in AWS Console → Directory Service
+{expand}
+
+{expand:title=User Doesn't Have Local Admin Rights}
+# Verify user is in {{WorkSpaces-LocalAdmins}} group (Step 2)
+# If recently added, reboot the WorkSpace to apply GPO
+# Force GPO update on WorkSpace:
+#* Log in as user
+#* Open CMD as admin: {{gpupdate /force}}
+{expand}
+
+{expand:title=S: Drive Not Appearing}
+# Check if RcloneS3Mount service is running:
+#* On WorkSpace: {{Get-Service RcloneS3Mount}}
+# If not running, manually trigger:
+#* Run {{\\example.internal\NETLOGON\Mount-S3-Drive.ps1}} as admin
+# Check logs: {{C:\Windows\Temp\s3-mount.log}}
+{expand}
+
+{expand:title=WorkSpace Stuck in PENDING}
+* Wait up to 20 minutes for initial provisioning
+* If stuck longer, check AWS Console for error messages
+* Verify AD Connector is healthy
+{expand}
+
+----
+
+h2. Important Information
+
+h3. Domain Controllers
+
+||Name||IP Address||Region||Instance ID||
+|DC01|x.x.x.x|us-east-2|{{i-0e5f7fdd4219cc530}}|
+|DC02|x.x.x.x|us-east-2|{{i-06be6d78fcd450fe8}}|
+|DC03|x.x.x.x|ap-southeast-1|{{i-05cf822be01cc752d}}|
+
+h3. Credentials Storage
+
+{info}
+All credentials are stored securely in AWS Secrets Manager. *Never hardcode passwords in documentation or scripts.*
+
+*Secret Location:*
+* *Secret Name:* {{org-infrastructure/credentials}}
+* *Region:* {{us-east-2}}
+
+*To retrieve:*
+{code:language=bash}
+aws secretsmanager get-secret-value \
+  --region us-east-2 \
+  --secret-id org-infrastructure/credentials \
+  --query SecretString --output text | jq .
+{code}
+
+*Available Keys in Secret:*
+* {{administrator_password}} - Domain admin password
+* {{<username>_password}} - Individual user passwords (if stored)
+{info}
+
+h3. AD Domain Information
+
+||Property||Value||
+|Domain|{{example.internal}}|
+|NetBIOS|{{ORG}}|
+
+h3. WorkSpaces Bundle ID
+
+||Bundle||ID||
+|Standard Bundle|{{wsb-09fdsggz9}}|
+
+----
+
+h2. Checklist Summary
+
+|| ||Task||
+|{status:colour=Grey|title=  }|Created AD user account|
+|{status:colour=Grey|title=  }|Added user to {{Domain Users}} group|
+|{status:colour=Grey|title=  }|Added user to {{WorkSpaces-LocalAdmins}} group|
+|{status:colour=Grey|title=  }|Verified user in AD|
+|{status:colour=Grey|title=  }|Added user to terraform.tfvars|
+|{status:colour=Grey|title=  }|Ran {{terraform apply}}|
+|{status:colour=Grey|title=  }|WorkSpace status is {{AVAILABLE}}|
+|{status:colour=Grey|title=  }|Sent login information to user (via secure channel)|
+|{status:colour=Grey|title=  }|User confirmed successful login|
+
+----
+
+{tip:title=Document Info}
+*Last Updated:* December 2024
+*Maintained by:* Infrastructure Team
+{tip}

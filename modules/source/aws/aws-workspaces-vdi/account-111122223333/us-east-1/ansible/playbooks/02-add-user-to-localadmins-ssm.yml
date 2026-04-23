@@ -1,0 +1,174 @@
+# ==============================================================================
+# PLAYBOOK: 02-add-user-to-localadmins-ssm.yml
+# Adds a user to the WorkSpaces-LocalAdmins group
+#
+# Usage:
+#   ansible-playbook playbooks/02-add-user-to-localadmins-ssm.yml -e "username=rochellec"
+#   ansible-playbook playbooks/02-add-user-to-localadmins-ssm.yml -e "username=jsmith"
+#
+# Run: ansible-playbook playbooks/02-add-user-to-localadmins-ssm.yml -e "username=USERNAME"
+# ==============================================================================
+---
+- name: Add User to WorkSpaces Local Admins Group
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    ansible_shell_type: sh
+    username: ""  # Must be provided via -e "username=xxx"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # Validate Input
+    # --------------------------------------------------------------------------
+    - name: Validate username provided
+      ansible.builtin.fail:
+        msg: "Username is required. Usage: ansible-playbook playbooks/02-add-user-to-localadmins-ssm.yml -e \"username=USERNAME\""
+      when: username == ""
+
+    # --------------------------------------------------------------------------
+    # Verify User Exists
+    # --------------------------------------------------------------------------
+    - name: Verify user exists in AD
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["try { $user = Get-ADUser -Identity \"{{ username }}\" -ErrorAction Stop; Write-Output \"USER_EXISTS:$($user.SamAccountName)\" } catch { Write-Output \"USER_NOT_FOUND\" }"]'
+          --output json
+      register: user_check_cmd
+
+    - name: Wait for user check
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (user_check_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: user_check_result
+      until: user_check_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Fail if user not found
+      ansible.builtin.fail:
+        msg: "User '{{ username }}' not found in Active Directory"
+      when: "'USER_NOT_FOUND' in user_check_result.stdout"
+
+    # --------------------------------------------------------------------------
+    # Add User to Group
+    # --------------------------------------------------------------------------
+    - name: Add user to WorkSpaces-LocalAdmins group
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["try { Add-ADGroupMember -Identity \"{{ workspaces_local_admin_group }}\" -Members \"{{ username }}\" -ErrorAction Stop; Write-Output \"SUCCESS: Added {{ username }} to {{ workspaces_local_admin_group }}\" } catch { if ($_.Exception.Message -like \"*already a member*\") { Write-Output \"INFO: {{ username }} is already a member of {{ workspaces_local_admin_group }}\" } else { Write-Output \"ERROR: $($_.Exception.Message)\" } }"]'
+          --output json
+      register: add_cmd
+
+    - name: Wait for group add
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (add_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: add_result
+      until: add_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: "{{ add_result.stdout | trim }}"
+
+    # --------------------------------------------------------------------------
+    # Show Current Group Members
+    # --------------------------------------------------------------------------
+    - name: Get current group members
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["Write-Output \"Current {{ workspaces_local_admin_group }} members:\"; Get-ADGroupMember -Identity \"{{ workspaces_local_admin_group }}\" | Format-Table Name,SamAccountName -AutoSize"]'
+          --output json
+      register: members_cmd
+
+    - name: Wait for members list
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (members_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: members_result
+      until: members_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Display group members
+      ansible.builtin.debug:
+        msg: "{{ members_result.stdout }}"
+
+    # --------------------------------------------------------------------------
+    # Force Replication
+    # --------------------------------------------------------------------------
+    - name: Force AD replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm send-command
+          --region {{ dc01.region }}
+          --instance-ids {{ dc01.instance_id }}
+          --document-name "AWS-RunPowerShellScript"
+          --parameters commands='["repadmin /syncall /A /e /P | Out-Null; Write-Output \"Replication initiated to all DCs\""]'
+          --output json
+      register: repl_cmd
+
+    - name: Wait for replication
+      ansible.builtin.command:
+        cmd: >
+          aws ssm get-command-invocation
+          --region {{ dc01.region }}
+          --command-id {{ (repl_cmd.stdout | from_json).Command.CommandId }}
+          --instance-id {{ dc01.instance_id }}
+          --query "StandardOutputContent"
+          --output text
+      register: repl_result
+      until: repl_result is succeeded
+      retries: 10
+      delay: 5
+
+    - name: Complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          USER ADDED TO LOCAL ADMINS
+          ============================================
+          
+          User: {{ username }}
+          Group: {{ workspaces_local_admin_group }}
+          
+          When {{ username }}'s WorkSpace applies Group Policy,
+          they will have local administrator rights.
+          
+          Note: Existing WorkSpaces may need to run:
+            gpupdate /force
+          Or reboot to apply the new policy.
+          ============================================

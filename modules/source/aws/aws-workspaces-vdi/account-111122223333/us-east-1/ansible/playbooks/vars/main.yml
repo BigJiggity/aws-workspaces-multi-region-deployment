@@ -1,0 +1,89 @@
+# ==============================================================================
+# CENTRAL VARIABLES FILE - VDI Configuration (US-East-1)
+# Project: org-workspaces-vdi
+#
+# This file contains VDI/WorkSpaces-specific configuration for us-east-1.
+# For AD-related variables, see account-111122223333/ansible/playbooks/vars/main.yml
+#
+# Usage in playbooks:
+#   vars_files:
+#     - vars/main.yml
+# ==============================================================================
+---
+# ------------------------------------------------------------------------------
+# REGION CONFIGURATION
+# ------------------------------------------------------------------------------
+aws_region: "us-east-1"
+
+# ------------------------------------------------------------------------------
+# DOMAIN CONTROLLER REFERENCES
+# These DCs are managed by account-111122223333 project
+# DC02 is LOCAL to us-east-1 for low-latency authentication
+# DC01 is FALLBACK via TGW peering to us-east-2
+# ------------------------------------------------------------------------------
+dc01:
+  instance_id: "i-0d74f088f44fc088b"
+  hostname: "DC01"
+  region: "us-east-2"
+  private_ip: "10.0.12.10"
+
+# DC02 IN US-EAST-1 (December 2025)
+dc02:
+  instance_id: "i-057c205efd2d28087"
+  hostname: "DC02"
+  region: "us-east-1"
+  private_ip: "10.1.12.10"
+
+dc03:
+  instance_id: "i-0f2607ac2de5b1f24"
+  hostname: "DC03"
+  region: "ap-southeast-1"
+  private_ip: "10.2.10.10"
+
+# ------------------------------------------------------------------------------
+# ACTIVE DIRECTORY DOMAIN
+# ------------------------------------------------------------------------------
+ad_domain_name: "example.internal"
+ad_netbios_name: "ORG"
+
+# ------------------------------------------------------------------------------
+# WORKSPACES CONFIGURATION
+# ------------------------------------------------------------------------------
+# Security group for users who need local admin on WorkSpaces
+workspaces_local_admin_group: "WorkSpaces-LocalAdmins"
+
+# GPO name for local admin policy
+workspaces_local_admin_gpo: "WorkSpaces-LocalAdminPolicy"
+
+# OU where WorkSpaces computer objects are created
+workspaces_computers_ou: "OU=WorkSpaces Computers,DC=example,DC=internal"
+
+# OU for WorkSpaces users
+workspaces_users_ou: "OU=WorkSpaces Users,DC=example,DC=internal"
+
+# ------------------------------------------------------------------------------
+# AD CONNECTOR CONFIGURATION
+# ------------------------------------------------------------------------------
+ad_connector_service_account: "svc_adconnector"
+
+# Credentials are stored in AWS Secrets Manager: org-infrastructure/credentials
+# To load in playbooks: include_tasks: load-secrets.yml
+# This sets: svc_adconnector_password
+
+# DNS IPs for AD Connector (DC02 LOCAL primary + DC01 fallback via TGW)
+# DC02 is now local to us-east-1 for fast authentication
+ad_connector_dns_ips:
+  - "10.1.12.10"  # DC02 (us-east-1) - LOCAL, primary
+  - "10.0.12.10"  # DC01 (us-east-2) - FALLBACK via TGW
+
+# ------------------------------------------------------------------------------
+# S3 INSTALLERS BUCKET (MOUNTED AS S: DRIVE VIA RCLONE)
+# Shared bucket across all regions
+# ------------------------------------------------------------------------------
+s3_installers_bucket: "org-workspace-vdi-installs"
+s3_installers_region: "ap-southeast-1"
+
+# Mount configuration (set in 06-configure-s3-rclone-mount-ssm.yml)
+# - Drive letter: S:
+# - Service name: RcloneS3Mount
+# - Credentials: org-workspaces-s3-sync-credentials (Secrets Manager)

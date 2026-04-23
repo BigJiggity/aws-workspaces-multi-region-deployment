@@ -1,0 +1,47 @@
+# ==============================================================================
+# ROLE: aws_secrets
+# Retrieves credentials from AWS Secrets Manager
+#
+# Usage in playbooks:
+#   - name: My Playbook
+#     hosts: localhost
+#     roles:
+#       - aws_secrets
+#     tasks:
+#       - debug:
+#           msg: "Password is {{ ad_admin_password }}"
+#
+# Or include tasks directly:
+#   - include_role:
+#       name: aws_secrets
+# ==============================================================================
+---
+- name: Get secret from AWS Secrets Manager
+  ansible.builtin.command:
+    cmd: >
+      aws secretsmanager get-secret-value
+      --region {{ secrets_region | default('us-east-2') }}
+      --secret-id {{ secrets_name | default('org-infrastructure/credentials') }}
+      --query SecretString
+      --output text
+  register: secrets_result
+  changed_when: false
+  no_log: true
+
+- name: Parse secrets JSON
+  ansible.builtin.set_fact:
+    org_credentials: "{{ secrets_result.stdout | from_json }}"
+  no_log: true
+
+- name: Set individual credential facts
+  ansible.builtin.set_fact:
+    ad_admin_password: "{{ org_credentials.ad_admin_password }}"
+    ad_safe_mode_password: "{{ org_credentials.ad_safe_mode_password }}"
+    svc_workspaces_password: "{{ org_credentials.svc_workspaces_password }}"
+    svc_adconnector_password: "{{ org_credentials.svc_adconnector_password }}"
+    # Add more as needed
+  no_log: true
+
+- name: Confirm secrets loaded
+  ansible.builtin.debug:
+    msg: "Credentials loaded from AWS Secrets Manager ({{ secrets_name | default('org-infrastructure/credentials') }})"
