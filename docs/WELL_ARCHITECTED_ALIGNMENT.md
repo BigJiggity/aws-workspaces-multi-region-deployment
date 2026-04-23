@@ -1,4 +1,4 @@
-# AWS Well-Architected Alignment (Merged Template)
+# AWS Well-Architected Alignment
 
 This repository maps implementation controls to all six AWS Well-Architected pillars.
 

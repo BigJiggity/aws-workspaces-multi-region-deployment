@@ -32,7 +32,7 @@ resource "aws_db_parameter_group" "vaultwarden" {
   family      = "postgres16"
   description = "Parameter group for VaultWarden PostgreSQL 16"
 
-  # SSL enforcement
+  # TLS enforcement
   parameter {
     name  = "rds.force_ssl"
     value = "1"

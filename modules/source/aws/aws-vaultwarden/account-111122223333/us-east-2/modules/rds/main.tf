@@ -27,7 +27,7 @@ resource "aws_db_parameter_group" "main" {
   family      = "postgres16"
   description = "Database parameter group for VaultWarden"
 
-  # Force SSL connections
+  # Force TLS connections
   parameter {
     name  = "rds.force_ssl"
     value = "1"

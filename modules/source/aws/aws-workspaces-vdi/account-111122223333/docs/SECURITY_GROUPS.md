@@ -37,7 +37,7 @@ All security groups are configured to allow **bidirectional** Active Directory t
 | TCP | 445 | x.x.x.x/xx, x.x.x.x/xx | SMB (Group Policy, file sharing) |
 | TCP | 464 | x.x.x.x/xx, x.x.x.x/xx | Kerberos password change |
 | UDP | 464 | x.x.x.x/xx, x.x.x.x/xx | Kerberos password change |
-| TCP | 636 | x.x.x.x/xx, x.x.x.x/xx | LDAPS (LDAP over SSL) |
+| TCP | 636 | x.x.x.x/xx, x.x.x.x/xx | LDAPS (LDAP over TLS) |
 | TCP | 3268-3269 | x.x.x.x/xx, x.x.x.x/xx | Global Catalog (forest searches) |
 | TCP | 49152-65535 | x.x.x.x/xx, x.x.x.x/xx | RPC dynamic ports |
 
@@ -72,7 +72,7 @@ All security groups are configured to allow **bidirectional** Active Directory t
 | TCP | 445 | x.x.x.x/xx, x.x.x.x/xx | SMB (Group Policy, file sharing) |
 | TCP | 464 | x.x.x.x/xx, x.x.x.x/xx | Kerberos password change |
 | UDP | 464 | x.x.x.x/xx, x.x.x.x/xx | Kerberos password change |
-| TCP | 636 | x.x.x.x/xx, x.x.x.x/xx | LDAPS (LDAP over SSL) |
+| TCP | 636 | x.x.x.x/xx, x.x.x.x/xx | LDAPS (LDAP over TLS) |
 | TCP | 3268-3269 | x.x.x.x/xx, x.x.x.x/xx | Global Catalog |
 | TCP | 49152-65535 | x.x.x.x/xx, x.x.x.x/xx | RPC dynamic ports |
 

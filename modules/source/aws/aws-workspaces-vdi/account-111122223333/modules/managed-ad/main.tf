@@ -193,7 +193,7 @@ resource "aws_security_group" "managed_ad" {
     }
   }
 
-  # LDAPS - LDAP over SSL
+  # LDAPS - LDAP over TLS
   ingress {
     description = "LDAPS"
     from_port   = 636

@@ -1,4 +1,4 @@
-# AWS Multi-Region Deployment (Terragrunt + Terraform)
+# AWS WorkSpaces Multi-Region Deployment (Terragrunt + Terraform)
 
 ## What This Project Delivers
 - Terragrunt repository layout aligned to best practices (`root.hcl`, `live/`, `modules/source/`).
@@ -57,5 +57,5 @@ This script updates:
 - WorkSpaces pool values (VPC, subnets, SAML secret ARN)
 
 ## Notes
-- Legacy scripts are retained in `scripts/*-legacy.*` for reference.
-- Some imported legacy stacks from `ssl-wrkspc` may require additional environment-specific tuning before production use.
+- This repository is maintained as a standalone deployment template.
+- Validate environment-specific values in `config/deployment.env` before production rollout.

@@ -135,9 +135,9 @@
         state: present
         enabled: true
 
-    - name: Create AD Global Catalog SSL firewall rule
+    - name: Create AD Global Catalog TLS firewall rule
       community.windows.win_firewall_rule:
-        name: AD-GC-SSL
+        name: AD-GC-TLS
         localport: 3269
         protocol: tcp
         direction: in

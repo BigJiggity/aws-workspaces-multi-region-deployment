@@ -174,7 +174,7 @@ resource "aws_security_group" "ad_replica" {
     }
   }
 
-  # LDAPS - LDAP over SSL
+  # LDAPS - LDAP over TLS
   ingress {
     description = "LDAPS from allowed networks"
     from_port   = 636
