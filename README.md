@@ -1,9 +1,5 @@
 # AWS Multi-Region Deployment (Terragrunt + Terraform)
 
-Unified and sanitized deployment template merged from:
-- `ssl-wrkspc` (multi-stack Terragrunt hierarchy and multi-region infrastructure stacks)
-- `cms-workspc` (WorkSpaces platform modules, bootstrap scripts, and operational runbooks)
-
 ## What This Project Delivers
 - Terragrunt repository layout aligned to best practices (`root.hcl`, `live/`, `modules/source/`).
 - Multi-region deployment scaffold with account/region pathing under `live/aws/...`.
